@@ -1,0 +1,14 @@
+## Note: PyTorch 2.6 changed the default behavior of torch.load to weights-only.
+## For maximum reproducibility you can pin a tested version (e.g., torch==2.5.1).
+## The codebase is defensive and will attempt weights-only loads when appropriate,
+## but tests and resume logic may require full checkpoint loading (weights_only=False).
+torch>=2.1.0
+torchvision>=0.16.0
+einops>=0.7.0
+opencv-python>=4.9.0
+Pillow>=10.0
+pytorch-msssim>=1.0.0
+scipy>=1.11
+PyYAML>=6.0
+tensorboard>=2.15
+tqdm>=4.66

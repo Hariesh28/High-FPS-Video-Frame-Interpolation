@@ -1,0 +1,95 @@
+# GMTI-Net Configuration
+# NTIRE 2026 High FPS Video Frame Interpolation Challenge
+
+# Dataset
+data:
+  train_dir: "train"
+  val_dir: "val"
+  crop_size: 256
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+
+# Model
+model:
+  encoder:
+    stage1_channels: 32
+    stage2_channels: 64
+    stage3_channels: 96
+    stage4_channels: 128
+    stage5_channels: 160
+    swin_depth: 2
+    swin_heads: 4
+    swin_window_size: 8
+    swin_mlp_ratio: 4.0
+  flow:
+    refinement_iters: 3
+    use_deformable: true
+  transformer:
+    blocks: 6
+    heads: 8
+    embed_dim: 128
+    mlp_ratio: 4.0
+  decoder:
+    num_res_blocks_lf: 2
+    num_res_blocks_detail: 4
+
+# Loss weights
+loss:
+  charbonnier: 1.0
+  laplacian: 0.2
+  warping: 0.1
+  bidirectional: 0.05
+  smoothness: 0.01
+  charbonnier_eps: 1.0e-3
+
+# Multi-scale supervision
+multiscale:
+  scales: [0.0625, 0.125, 0.25, 1.0] # 1/16, 1/8, 1/4, 1
+  weights: [0.1, 0.2, 0.5, 1.0]
+
+# Training & Numerics
+training:
+  proj_dim: 128
+  corr_chunk_size: 1024
+  corr_temp: 0.1
+  corr_clamp: 50.0
+  corr_topk: null # set to 32 for very large inputs
+  convex_kernel: 3
+  convex_upscale: 2 # mask channels -> 9 * 4 = 36
+  convex_mask_init: "xavier"
+  optimizer: "adamw"
+  lr: 2.0e-4
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 1.0e-4
+  warmup_iters: 2000
+  final_lr: 1.0e-6
+  batch_size: 16
+  accumulate_steps: 4
+  clip_norm: 1.0
+  ema_decay: 0.9999
+  amp: true
+  checkpoint_freq: 5000
+  val_freq: 2000
+  seed: 2026
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+
+# Inference
+inference:
+  self_ensemble: true
+  checkpoint_avg: 5
+  multiscale: [1.0, 1.25]
+
+# Augmentation
+augmentation:
+  random_crop: 1.0
+  horizontal_flip: 0.5
+  vertical_flip: 0.5
+  rotation: 0.25
+  temporal_reversal: 0.5
+  brightness: 0.1
+  contrast: 0.1
+  gamma: 0.05

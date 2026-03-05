@@ -1,0 +1,10 @@
+train/
+val/
+logs/
+checkpoints/
+*.pyc
+__pycache__/
+.vscode/
+.env
+*.pth
+*.pt
