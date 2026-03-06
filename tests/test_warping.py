@@ -26,13 +26,11 @@ def test_backward_warp_shape_and_no_nan():
 
 
 def test_backward_warp_single_pixel_shift():
-    """A white pixel at (r,c) shifted by integer (dx,dy) lands at (r+dy, c+dx).
+    """A white pixel at (r,c) warped by tracking offset (dx,dy) lands at (r-dy, c-dx).
 
-    Uses align_corners=True convention:
-      normalised coord = 2*p/(W-1) - 1   for x-axis
-                       = 2*p/(H-1) - 1   for y-axis
-    So a constant-displacement flow of (dx=2, dy=3) should move the pixel
-    from (row=10, col=10) to (row=13, col=12).
+    Using backward grid_sample logic: output[y,x] pulls from input[y+dy, x+dx].
+    So a constant offset grid of (dx=2, dy=3) pulls the source pixel
+    from (row=10, col=10) and places it into output at (row=7, col=8).
     """
     B, C, H, W = 1, 1, 64, 64
     img = torch.zeros(B, C, H, W)
@@ -46,10 +44,10 @@ def test_backward_warp_single_pixel_shift():
     warped = backward_warp(img, flow)
 
     # The warped value at the destination should be close to 1.0
-    val_at_dest = warped[0, 0, 10 + dy, 10 + dx].item()
+    val_at_dest = warped[0, 0, 10 - dy, 10 - dx].item()
     assert (
         val_at_dest > 0.9
-    ), f"Expected warped pixel > 0.9 at ({10+dy},{10+dx}), got {val_at_dest:.4f}"
+    ), f"Expected warped pixel > 0.9 at ({10-dy},{10-dx}), got {val_at_dest:.4f}"
 
 
 def test_zero_flow_preserves_image():
