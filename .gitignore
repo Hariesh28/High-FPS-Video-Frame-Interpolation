@@ -1,10 +1,25 @@
+# Directories
 train/
 val/
+test/
+data/
 logs/
 checkpoints/
-*.pyc
+results/
+colab_results/
+runs/
 __pycache__/
+.venv/
+venv/
+env/
 .vscode/
-.env
+.idea/
+.ipynb_checkpoints/
+
+# Files
+*.pyc
 *.pth
 *.pt
+*.npy
+.env
+.DS_Store
