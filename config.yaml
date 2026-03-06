@@ -31,8 +31,8 @@ model:
     # swin_depth: 4   # more accurate, higher VRAM cost
     # swin_heads: 8   # pairs with depth=4 (128 channels / 8 heads = 16 dim)
     # ──────────────────────────────────────────────────────────────────────
-    swin_depth: 2 # change to 4 for NTIRE full-run
-    swin_heads: 4 # change to 8 for NTIRE full-run
+    swin_depth: 4 # Full NTIRE capacity
+    swin_heads: 8 # Full NTIRE capacity
     swin_window_size: 8
     swin_mlp_ratio: 4.0
   flow:
@@ -133,8 +133,8 @@ curriculum:
       patch_size: 256
       max_iters: 120000
       lr: 2.0e-4
-      datasets: [ntire, vimeo90k, adobe240] # early: learn motion
-      description: "Pretrain — learn general motion on mixed data"
+      datasets: [ntire] # Only use NTIRE dataset
+      description: "Pretrain — learn general motion on NTIRE dataset"
     - stage: 2
       patch_size: 384
       max_iters: 80000 # cumulative: 200k
