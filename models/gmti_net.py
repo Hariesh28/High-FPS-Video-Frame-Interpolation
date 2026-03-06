@@ -39,7 +39,7 @@ class GMTINet(nn.Module):
         in_channels=3,
         encoder_channels=(32, 64, 96, 128, 160),
         swin_depth=4,
-        swin_heads=6,
+        swin_heads=8,
         swin_window_size=8,
         swin_mlp_ratio=4.0,
         flow_refinement_iters=3,

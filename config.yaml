@@ -29,10 +29,10 @@ model:
     # swin_depth=2, swin_heads=4 — fast iteration, lower VRAM.
     # ── NTIRE full-run recommended values ─────────────────────────────────
     # swin_depth: 4   # more accurate, higher VRAM cost
-    # swin_heads: 6   # pairs with depth=4
+    # swin_heads: 8   # pairs with depth=4 (128 channels / 8 heads = 16 dim)
     # ──────────────────────────────────────────────────────────────────────
     swin_depth: 2 # change to 4 for NTIRE full-run
-    swin_heads: 4 # change to 6 for NTIRE full-run
+    swin_heads: 4 # change to 8 for NTIRE full-run
     swin_window_size: 8
     swin_mlp_ratio: 4.0
   flow:
