@@ -12,15 +12,24 @@ from utils.io import safe_torch_load
 
 
 def test_scaler_state_not_empty():
-    """GradScaler.state_dict() must be non-empty."""
-    scaler = torch.amp.GradScaler(enabled=False)
+    """GradScaler.state_dict() must be non-empty after use."""
+    scaler = torch.amp.GradScaler(
+        "cuda" if torch.cuda.is_available() else "cpu", enabled=True
+    )
+    # PyTorch >= 2.4 returns empty dict until first scale pass
+    dummy_loss = torch.tensor(1.0, requires_grad=True)
+    scaler.scale(dummy_loss).backward()
     state = scaler.state_dict()
-    assert len(state) > 0, "GradScaler state_dict should not be empty"
+    assert len(state) > 0, "GradScaler state_dict should not be empty after a backpass"
 
 
 def test_scaler_contains_scale_key():
-    """GradScaler state_dict should contain a scale / _scale key."""
-    scaler = torch.amp.GradScaler(enabled=False)
+    """GradScaler state_dict should contain a scale / _scale key after use."""
+    scaler = torch.amp.GradScaler(
+        "cuda" if torch.cuda.is_available() else "cpu", enabled=True
+    )
+    dummy_loss = torch.tensor(1.0, requires_grad=True)
+    scaler.scale(dummy_loss).backward()
     state = scaler.state_dict()
     # PyTorch ≥2.1 uses '_scale'; older versions may use 'scale'
     has_scale = any("scale" in k.lower() for k in state.keys())

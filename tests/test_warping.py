@@ -19,12 +19,10 @@ def test_backward_warp_shape_and_no_nan():
     img = torch.randn(B, C, H, W)
     flow = torch.randn(B, 2, H, W) * 5.0
 
-    warped, valid = backward_warp(img, flow)
+    warped = backward_warp(img, flow)
 
     assert warped.shape == (B, C, H, W), f"Shape mismatch: {warped.shape}"
-    assert valid.shape == (B, 1, H, W)
     assert not torch.isnan(warped).any(), "NaN in warped output"
-    assert not torch.isnan(valid).any(), "NaN in valid mask"
 
 
 def test_backward_warp_single_pixel_shift():
@@ -45,7 +43,7 @@ def test_backward_warp_single_pixel_shift():
     flow[0, 0] = float(dx)  # channel 0 = x-displacement
     flow[0, 1] = float(dy)  # channel 1 = y-displacement
 
-    warped, valid = backward_warp(img, flow)
+    warped = backward_warp(img, flow)
 
     # The warped value at the destination should be close to 1.0
     val_at_dest = warped[0, 0, 10 + dy, 10 + dx].item()
@@ -60,7 +58,7 @@ def test_zero_flow_preserves_image():
     img = torch.rand(B, C, H, W)
     flow = torch.zeros(B, 2, H, W)
 
-    warped, valid = backward_warp(img, flow)
+    warped = backward_warp(img, flow)
 
     assert torch.allclose(
         warped, img, atol=1e-5
@@ -88,7 +86,7 @@ def test_backward_warp_half_precision():
     img = torch.rand(B, C, H, W, dtype=torch.float16, device=device)
     flow = torch.rand(B, 2, H, W, dtype=torch.float16, device=device) * 4.0
 
-    warped, valid = backward_warp(img, flow)
+    warped = backward_warp(img, flow)
 
     assert warped.dtype == torch.float16, "Output dtype should match input (fp16)"
     assert not torch.isnan(warped).any(), "NaN in fp16 warped output"

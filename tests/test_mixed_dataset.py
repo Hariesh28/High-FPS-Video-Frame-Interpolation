@@ -112,8 +112,22 @@ def test_item_shapes(tmp_path):
     ds_a = make_dummy_ntire(tmp_path / "a", n_videos=1, n_frames=4, size=(64, 64))
     ds_b = make_dummy_ntire(tmp_path / "b", n_videos=1, n_frames=4, size=(64, 64))
     # Override crop_size to a known value
+    # Pass crop sizes directly to dataset constructor so transform is properly built
+    ds_a = make_dummy_ntire(tmp_path / "a", n_videos=1, n_frames=4, size=(64, 64))
+    ds_b = make_dummy_ntire(tmp_path / "b", n_videos=1, n_frames=4, size=(64, 64))
+    ds_a.crop_size = crop
+    ds_b.crop_size = crop
+
+    # Needs to rebuild transformations since crop_size changed
+    from torchvision import transforms
+
     for ds in (ds_a, ds_b):
-        ds.crop_size = crop
+        ds.transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.RandomCrop(crop),
+            ]
+        )
 
     concat, _ = MixedDataset.build(
         datasets=[ds_a, ds_b], weights=[0.5, 0.5], num_samples=10
