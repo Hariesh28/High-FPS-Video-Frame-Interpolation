@@ -147,35 +147,55 @@ def train(config, args):
 
     for name in dataset_names:
         if name.lower() == "ntire":
-            ds_list.append(
-                NTIREDataset(
-                    root=config["data"]["train_dir"],
-                    mode="train",
-                    crop_size=config["data"]["crop_size"],
-                    augment=True,
+            try:
+                ds_list.append(
+                    NTIREDataset(
+                        root=config["data"]["train_dir"],
+                        mode="train",
+                        crop_size=config["data"]["crop_size"],
+                        augment=True,
+                    )
                 )
-            )
-            w_list.append(mix_weights.get("ntire", 1.0))
+                w_list.append(mix_weights.get("ntire", 1.0))
+            except FileNotFoundError:
+                print(
+                    f"[Warning] NTIRE dataset not found at {config['data']['train_dir']}. Skipping."
+                )
         elif name.lower() == "vimeo90k":
-            ds_list.append(
-                Vimeo90KDataset(
-                    root="data/vimeo_triplet",
-                    split="train",
-                    crop_size=config["data"]["crop_size"],
-                    augment=True,
+            try:
+                ds_list.append(
+                    Vimeo90KDataset(
+                        root="data/vimeo_triplet",
+                        split="train",
+                        crop_size=config["data"]["crop_size"],
+                        augment=True,
+                    )
                 )
-            )
-            w_list.append(mix_weights.get("vimeo90k", 0.3))
+                w_list.append(mix_weights.get("vimeo90k", 0.3))
+            except FileNotFoundError:
+                print(
+                    f"[Warning] Vimeo90K dataset not found at data/vimeo_triplet. Skipping."
+                )
         elif name.lower() == "adobe240":
-            ds_list.append(
-                Adobe240Dataset(
-                    root="data/adobe240",
-                    split="train",
-                    crop_size=config["data"]["crop_size"],
-                    augment=True,
+            try:
+                ds_list.append(
+                    Adobe240Dataset(
+                        root="data/adobe240",
+                        split="train",
+                        crop_size=config["data"]["crop_size"],
+                        augment=True,
+                    )
                 )
-            )
-            w_list.append(mix_weights.get("adobe240", 0.1))
+                w_list.append(mix_weights.get("adobe240", 0.1))
+            except FileNotFoundError:
+                print(
+                    f"[Warning] Adobe240 dataset not found at data/adobe240. Skipping."
+                )
+
+    if not ds_list:
+        raise RuntimeError(
+            "No datasets were successfully loaded. Please check your data directions."
+        )
 
     sampler_mode = config.get("hard_sampler", {}).get("mode", "off")
     is_psnr_biased = sampler_mode == "psnr_biased"

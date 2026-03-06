@@ -133,8 +133,8 @@ curriculum:
       patch_size: 256
       max_iters: 120000
       lr: 2.0e-4
-      datasets: [ntire] # Only use NTIRE dataset
-      description: "Pretrain — learn general motion on NTIRE dataset"
+      datasets: [ntire, vimeo90k, adobe240] # early: learn motion
+      description: "Pretrain — learn general motion on mixed data"
     - stage: 2
       patch_size: 384
       max_iters: 80000 # cumulative: 200k
