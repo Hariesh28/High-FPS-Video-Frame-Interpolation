@@ -116,7 +116,14 @@ class GMTINet(nn.Module):
         warped_feat_R, warped_img_R = self.warp_R(R, features_R[2], flow_rm, conf_rl)
 
         # 4. Occlusion estimation and blending
-        occ_mask = self.occlusion(warped_feat_L, warped_feat_R, flow_lr, flow_rl)
+        # Compute geometric consistency mask for training guidance
+        if self.training:
+            warped_rl = backward_warp(flow_rl, flow_lr)
+            bidir_err = (flow_lr + warped_rl).abs().mean(dim=1, keepdim=True)
+            geom_mask = (bidir_err < 1.0).float()
+            occ_mask = self.occlusion(warped_feat_L, warped_feat_R, geom_mask)
+        else:
+            occ_mask = self.occlusion(warped_feat_L, warped_feat_R)
         fused_feat = OcclusionNetwork.blend(warped_feat_L, warped_feat_R, occ_mask)
 
         # 5. Transformer fusion with motion guidance
