@@ -562,6 +562,15 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument(
+        "--stage", type=int, default=None, help="Curriculum stage index"
+    )
+    parser.add_argument(
+        "--patch_size", type=int, default=None, help="Override patch/crop size"
+    )
+    parser.add_argument(
+        "--save_freq", type=int, default=None, help="Override checkpoint save freq"
+    )
+    parser.add_argument(
         "--deterministic",
         action="store_true",
         help="Enable cudnn deterministic mode (slower, fully reproducible). "
@@ -579,6 +588,24 @@ def main():
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
+
+    if args.max_iters is not None:
+        config["training"]["max_iters"] = args.max_iters
+    if getattr(args, "patch_size", None) is not None:
+        config["data"]["crop_size"] = args.patch_size
+    if getattr(args, "save_freq", None) is not None:
+        config["training"]["checkpoint_freq"] = args.save_freq
+    if getattr(args, "stage", None) is not None:
+        stages = config.get("curriculum", {}).get("stages", [])
+        for s in stages:
+            if s.get("stage") == args.stage:
+                print(f"[Curriculum] Stage {args.stage}: {s.get('description', '')}")
+                if "patch_size" in s and getattr(args, "patch_size", None) is None:
+                    config["data"]["crop_size"] = s["patch_size"]
+                if "max_iters" in s and getattr(args, "max_iters", None) is None:
+                    config["training"]["max_iters"] = s["max_iters"]
+                if "lr" in s:
+                    config["training"]["lr"] = s["lr"]
 
     seed = args.seed or config["training"].get("seed", 42)
     seed_everything(seed, deterministic=getattr(args, "deterministic", False))
