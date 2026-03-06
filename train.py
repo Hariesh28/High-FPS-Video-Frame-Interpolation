@@ -19,9 +19,11 @@ import os
 import sys
 import math
 import copy
-import argparse
-import yaml
+import json
 import random
+import argparse
+import subprocess
+import yaml
 import numpy as np
 from collections import OrderedDict
 
@@ -35,18 +37,18 @@ from tqdm import tqdm
 from models.gmti_net import GMTINet
 from losses.flow_losses import CombinedLoss
 from datasets.ntire_dataset import NTIREDataset
-
-
-def seed_everything(seed=42):
-    """Seed all random number generators for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    # For reproducibility, disable the cuDNN benchmark autotuner which can
-    # introduce non-determinism by selecting different algorithms per input size.
-    torch.backends.cudnn.benchmark = False
+from utils.io import (
+    safe_torch_load,
+    extract_model_state,
+    atomic_save,
+    prune_checkpoints,
+)
+from utils.misc import (
+    seed_everything,
+    make_worker_init_fn,
+    log_environment,
+    _get_git_rev,
+)
 
 
 import torchvision.utils as vutils
@@ -114,20 +116,117 @@ def train(config, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Train] Using device: {device}")
 
-    # ---- Dataset ----
-    train_dataset = NTIREDataset(
-        root=config["data"]["train_dir"],
-        mode="train",
-        crop_size=config["data"]["crop_size"],
-        augment=True,
+    # ---- TensorBoard & Dirs (create early for log_environment) ----
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("visualizations", exist_ok=True)
+    writer = SummaryWriter("logs")
+
+    # ---- Environment logging (before dataset/model construction) ----
+    log_environment(writer, run_dir="logs")
+
+    # Debug visualisation frequency
+    vis_freq = getattr(args, "vis_freq", 1000)
+
+    # ---- Dataset & Sampler ----
+    stage_idx = getattr(args, "stage", 1) - 1
+    stages = config.get("curriculum", {}).get("stages", [])
+    if 0 <= stage_idx < len(stages):
+        dataset_names = stages[stage_idx].get("datasets", ["ntire"])
+    else:
+        dataset_names = ["ntire"]
+
+    from datasets.mixed import MixedDataset
+    from datasets.vimeo90k import Vimeo90KDataset
+    from datasets.adobe240 import Adobe240Dataset
+    from datasets.hard_sampler import FlowMagnitudeWeightedSampler, PSNRBiasedSampler
+
+    ds_list = []
+    w_list = []
+    mix_weights = config.get("dataset_mixing", {}).get("weights", {})
+
+    for name in dataset_names:
+        if name.lower() == "ntire":
+            ds_list.append(
+                NTIREDataset(
+                    root=config["data"]["train_dir"],
+                    mode="train",
+                    crop_size=config["data"]["crop_size"],
+                    augment=True,
+                )
+            )
+            w_list.append(mix_weights.get("ntire", 1.0))
+        elif name.lower() == "vimeo90k":
+            ds_list.append(
+                Vimeo90KDataset(
+                    root="data/vimeo_triplet",
+                    split="train",
+                    crop_size=config["data"]["crop_size"],
+                    augment=True,
+                )
+            )
+            w_list.append(mix_weights.get("vimeo90k", 0.3))
+        elif name.lower() == "adobe240":
+            ds_list.append(
+                Adobe240Dataset(
+                    root="data/adobe240",
+                    split="train",
+                    crop_size=config["data"]["crop_size"],
+                    augment=True,
+                )
+            )
+            w_list.append(mix_weights.get("adobe240", 0.1))
+
+    sampler_mode = config.get("hard_sampler", {}).get("mode", "off")
+    is_psnr_biased = sampler_mode == "psnr_biased"
+
+    class IndexWrapper(torch.utils.data.Dataset):
+        def __init__(self, ds):
+            self.ds = ds
+
+        def __len__(self):
+            return len(self.ds)
+
+        def __getitem__(self, i):
+            return (*self.ds[i], i)
+
+    if is_psnr_biased:
+        ds_list = [IndexWrapper(ds) for ds in ds_list]
+
+    seed = config["training"].get("seed", 42)
+    train_dataset, sampler = MixedDataset.build(
+        datasets=ds_list,
+        weights=w_list,
+        num_samples=100_000,
+        generator=torch.Generator().manual_seed(seed),
     )
+
+    if sampler_mode == "flow_magnitude":
+        sampler = FlowMagnitudeWeightedSampler(
+            train_dataset,
+            num_samples=100_000,
+            alpha=config["hard_sampler"].get("flow_mag_alpha", 0.5),
+            min_weight=config["hard_sampler"].get("flow_mag_min_weight", 1e-4),
+        )
+    elif is_psnr_biased:
+        sampler = PSNRBiasedSampler(
+            train_dataset,
+            num_samples=100_000,
+            temperature=config["hard_sampler"].get("psnr_temperature", 3.0),
+            init_psnr=config["hard_sampler"].get("psnr_init", 32.0),
+        )
+
+    worker_init = make_worker_init_fn(seed)
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["training"]["batch_size"],
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=config["data"]["num_workers"],
         pin_memory=True,
         drop_last=True,
+        persistent_workers=config["data"].get("num_workers", 0) > 0,
+        worker_init_fn=worker_init,
     )
 
     val_dataset = NTIREDataset(
@@ -140,8 +239,10 @@ def train(config, args):
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=2,
+        num_workers=min(2, config["data"].get("num_workers", 2)),
         pin_memory=True,
+        persistent_workers=config["data"].get("num_workers", 0) > 0,
+        worker_init_fn=make_worker_init_fn(config["training"].get("seed", 42) + 9999),
     )
 
     # ---- Model ----
@@ -168,6 +269,8 @@ def train(config, args):
         w_warp=config["loss"]["warping"],
         w_bidir=config["loss"]["bidirectional"],
         w_smooth=config["loss"]["smoothness"],
+        # MSE term directly optimises PSNR = -10*log10(MSE). Expected: +0.05-0.2 dB.
+        w_mse=config["loss"].get("mse", 0.1),
         charb_eps=config["loss"]["charbonnier_eps"],
         multiscale_scales=config["multiscale"]["scales"],
         multiscale_weights=config["multiscale"]["weights"],
@@ -192,29 +295,25 @@ def train(config, args):
     )
 
     # ---- EMA ----
-    ema = EMAModel(model, decay=config["training"]["ema_decay"])
+    # Read from ema.decay (new section) with fallback to training.ema_decay
+    ema_decay = config.get("ema", {}).get("decay") or config["training"].get(
+        "ema_decay", 0.9999
+    )
+    ema = EMAModel(model, decay=ema_decay)
+    print(f"[Train] EMA decay: {ema_decay}")
 
     # ---- AMP ----
     use_amp = config["training"]["amp"] and torch.cuda.is_available()
-    # Correct GradScaler construction. Do not pass device name as positional arg.
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
-    # ---- TensorBoard & Dirs ----
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("visualizations", exist_ok=True)
-    writer = SummaryWriter("logs")
+    # ---- Dirs (already created at top of train()) ----
 
     # ---- Resume checkpoint ----
     start_iter = 0
     if args.resume and os.path.exists(args.resume):
-        # Use the safe loader helper so behavior is consistent across torch versions
-        from utils.io import safe_torch_load
-
         ckpt = safe_torch_load(args.resume, map_location=device, weights_only=False)
 
-        # Load model weights (support both 'model' and 'ema' keys)
-        state_dict = ckpt.get("model", ckpt.get("ema", None))
+        state_dict = extract_model_state(ckpt, warn=True)
         if state_dict is None:
             raise KeyError(f"No model weights found in checkpoint: {args.resume}")
         model.load_state_dict(state_dict)
@@ -266,10 +365,16 @@ def train(config, args):
     for iteration in pbar:
         # Get batch
         try:
-            L, M, R = next(data_iter)
+            batch = next(data_iter)
         except StopIteration:
             data_iter = iter(train_loader)
-            L, M, R = next(data_iter)
+            batch = next(data_iter)
+
+        idx = None
+        if len(batch) == 4:
+            L, M, R, idx = batch
+        else:
+            L, M, R = batch
 
         L = L.to(device, non_blocking=True)
         M = M.to(device, non_blocking=True)
@@ -292,7 +397,6 @@ def train(config, args):
             )
             optimizer.zero_grad(set_to_none=True)
             # Do not update GradScaler when skipping a batch (no step taken).
-            continue
             continue
 
         # Backward pass
@@ -318,7 +422,21 @@ def train(config, args):
 
         # Compute PSNR
         with torch.no_grad():
-            psnr = compute_psnr(pred.clamp(0, 1), M)
+            mse_per_sample = F.mse_loss(pred.clamp(0, 1), M, reduction="none").mean(
+                dim=[1, 2, 3]
+            )
+            psnr_per_sample = -10 * torch.log10(torch.clamp(mse_per_sample, min=1e-10))
+            psnr = psnr_per_sample.mean().item()
+
+        # Update PSNR sampler history
+        if is_psnr_biased and idx is None and iteration == start_iter:
+            print(
+                "[Warning] PSNRBiasedSampler requires index but Dataset did not return it."
+            )
+        elif is_psnr_biased and idx is not None:
+            sampler.update_psnr_batch(idx.tolist(), psnr_per_sample.tolist())
+            if (iteration + 1) % 1000 == 0:
+                sampler.refresh_weights()
 
         # Logging
         current_lr = optimizer.param_groups[0]["lr"]
@@ -338,7 +456,7 @@ def train(config, args):
             writer.add_scalar(f"train/loss_{k}", v, iteration)
 
         # ---- Flow Visualization Debug Tool ----
-        if (iteration + 1) % 1000 == 0:
+        if (iteration + 1) % vis_freq == 0:
             with torch.no_grad():
                 B_vis = min(4, L.shape[0])  # Save up to 4 items in batch
                 vis_grid = torch.cat(
@@ -392,18 +510,11 @@ def train(config, args):
                 torch.save(ckpt_data, tmp_best)
                 os.replace(tmp_best, "checkpoints/best_ema.pth")
                 print(f"[Val] New best EMA PSNR: {best_psnr:.2f}")
-
         # ---- Checkpoint ----
         ckpt_freq = config["training"]["checkpoint_freq"]
         if (iteration + 1) % ckpt_freq == 0:
-            import random, numpy as np, subprocess
-
             try:
-                git_rev = (
-                    subprocess.check_output(["git", "rev-parse", "HEAD"])
-                    .decode("ascii")
-                    .strip()
-                )
+                git_rev = _get_git_rev()
             except Exception:
                 git_rev = "unknown"
 
@@ -426,15 +537,15 @@ def train(config, args):
                 "git_rev": git_rev,
                 "config": config,
             }
-            tmp_path = f"checkpoints/.tmp_iter_{iteration + 1}.pth"
             final_path = f"checkpoints/iter_{iteration + 1}.pth"
-            torch.save(checkpoint_data, tmp_path)
-            os.replace(tmp_path, final_path)
+            atomic_save(checkpoint_data, final_path)
+            atomic_save(checkpoint_data, "checkpoints/latest.pth")
 
-            # Atomic sync of latest as well
-            tmp_latest = "checkpoints/.tmp_latest.pth"
-            torch.save(checkpoint_data, tmp_latest)
-            os.replace(tmp_latest, "checkpoints/latest.pth")
+            # Prune old checkpoints (keep last N)
+            prune_checkpoints(
+                ckpt_dir="checkpoints",
+                keep_last=config["training"].get("keep_last_checkpoints", 5),
+            )
 
     writer.close()
     print(f"[Train] Complete! Best val PSNR: {best_psnr:.2f}")
@@ -450,13 +561,27 @@ def main():
         "--resume", type=str, default=None, help="Checkpoint to resume from"
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable cudnn deterministic mode (slower, fully reproducible). "
+        "Sets cudnn.deterministic=True, cudnn.benchmark=False.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug mode: save flow visualisations every 100 iters instead of 1000.",
+    )
     args = parser.parse_args()
+
+    # Debug vis frequency
+    args.vis_freq = 100 if args.debug else 1000
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
     seed = args.seed or config["training"].get("seed", 42)
-    seed_everything(seed)
+    seed_everything(seed, deterministic=getattr(args, "deterministic", False))
 
     train(config, args)
 

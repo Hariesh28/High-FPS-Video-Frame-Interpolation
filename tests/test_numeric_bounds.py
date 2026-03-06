@@ -7,7 +7,11 @@ from torch.amp import GradScaler
 
 
 def test_corr_chunking():
-    """Verify chunked processing equates exactly to non-chunked outputs."""
+    """Verify chunked processing equates exactly to non-chunked outputs.
+
+    Tolerance: rtol=1e-4, atol=1e-5 — fp32 chunked matmuls can produce tiny
+    rounding diffs vs a single large matmul; we allow those here.
+    """
     chunked_corr = GMFlowMatching(proj_dim=128, chunk_size=4)
     standard_corr = GMFlowMatching(proj_dim=128, chunk_size=1024)
 
@@ -20,8 +24,11 @@ def test_corr_chunking():
     flow_chunk, conf_chunk = chunked_corr(fL, fR)
     flow_std, conf_std = standard_corr(fL, fR)
 
-    assert torch.allclose(flow_chunk, flow_std, atol=1e-5), (
-        "Chunked sequence decoupled from full matching limits"
+    max_err = (flow_chunk - flow_std).abs().max().item()
+    mean_err = (flow_chunk - flow_std).abs().mean().item()
+    assert torch.allclose(flow_chunk, flow_std, rtol=1e-4, atol=1e-5), (
+        f"Chunked vs dense correlation mismatch: max_err={max_err:.2e}, mean_err={mean_err:.2e}. "
+        "fp32 chunked matmul should agree within rtol=1e-4."
     )
 
 
@@ -30,9 +37,9 @@ def test_convex_mask_channels():
     kernel = 3
     upscale = 2
     convex = ConvexMaskUpsample(128, kernel=kernel, upscale=upscale)
-    assert convex.mask_ch == (kernel**2) * (upscale**2), (
-        "Subpixel mask alignment channel count mismatched."
-    )
+    assert convex.mask_ch == (kernel**2) * (
+        upscale**2
+    ), "Subpixel mask alignment channel count mismatched."
 
 
 def test_occlusion_training_inference():
@@ -49,9 +56,9 @@ def test_occlusion_training_inference():
     occ.eval()
     mask_eval = occ(warp_L, warp_R, flow_lr, flow_rl)
 
-    assert not torch.allclose(mask_train, mask_eval), (
-        "Geom mask failed to deactivate across eval modes."
-    )
+    assert not torch.allclose(
+        mask_train, mask_eval
+    ), "Geom mask failed to deactivate across eval modes."
 
 
 def test_resume_checkpoint():

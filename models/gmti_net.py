@@ -122,8 +122,12 @@ class GMTINet(nn.Module):
         # 5. Transformer fusion with motion guidance
         fused = self.transformer(fused_feat, flow_lm)  # [B, 128, H/4, W/4]
 
-        # 6. Decode
-        pred = self.decoder(fused)  # [B, 3, H_padded, W_padded]
+        # 6. Decode residual
+        res = self.decoder(fused)  # [B, 3, H_padded, W_padded]
+
+        # 7. Residual addition (base is average of L and R)
+        base = (L + R) / 2.0
+        pred = base + res
 
         # Remove padding
         if pad_h > 0 or pad_w > 0:

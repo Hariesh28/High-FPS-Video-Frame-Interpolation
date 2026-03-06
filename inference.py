@@ -29,7 +29,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.gmti_net import GMTINet
-from utils.io import safe_torch_load
+from utils.io import safe_torch_load, extract_model_state
 
 
 def load_image(path, device="cuda"):
@@ -118,7 +118,7 @@ def average_checkpoints(checkpoint_paths, device="cuda"):
 
     for path in checkpoint_paths:
         ckpt = safe_torch_load(path, map_location=device, weights_only=True)
-        state = ckpt.get("model", ckpt.get("ema", None))
+        state = extract_model_state(ckpt, warn=True)
         if state is None:
             raise KeyError(f"No model weights found in checkpoint: {path}")
 
@@ -136,6 +136,80 @@ def average_checkpoints(checkpoint_paths, device="cuda"):
         avg_state[k] /= n
 
     return avg_state
+
+
+def load_model_for_inference(checkpoint_path, config_path=None, device="cuda"):
+    """Load a GMTINet model from a checkpoint, ready for inference.
+
+    This is the primary entry-point used by the Colab notebook (Cell 15)
+    and any external scripts that need a pre-built inference model.
+
+    Args:
+        checkpoint_path: Path to .pth checkpoint (supports avg_ema / best_ema / latest).
+        config_path:     Path to config.yaml.  If None, looks for config.yaml in the
+                         current directory and then in the checkpoint's parent directory.
+        device:          'cuda' or 'cpu'.
+
+    Returns:
+        (model, cfg) — model is in eval mode on the requested device.
+    """
+    import yaml, os
+
+    # ── resolve config ──────────────────────────────────────────────────────
+    if config_path is None:
+        candidates = [
+            "config.yaml",
+            os.path.join(os.path.dirname(str(checkpoint_path)), "..", "config.yaml"),
+        ]
+        config_path = next((c for c in candidates if os.path.isfile(c)), None)
+    if config_path is None or not os.path.isfile(str(config_path)):
+        raise FileNotFoundError(
+            "config.yaml not found. Pass config_path= explicitly or place it in the working directory."
+        )
+
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    # ── build model ─────────────────────────────────────────────────────────
+    enc = cfg["model"]["encoder"]
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    model = GMTINet(
+        swin_depth=enc["swin_depth"],
+        swin_heads=enc["swin_heads"],
+        swin_window_size=enc["swin_window_size"],
+        swin_mlp_ratio=enc["swin_mlp_ratio"],
+        flow_refinement_iters=cfg["model"]["flow"]["refinement_iters"],
+        use_deformable=cfg["model"]["flow"]["use_deformable"],
+        transformer_blocks=cfg["model"]["transformer"]["blocks"],
+        transformer_heads=cfg["model"]["transformer"]["heads"],
+        transformer_dim=cfg["model"]["transformer"]["embed_dim"],
+        transformer_mlp_ratio=cfg["model"]["transformer"]["mlp_ratio"],
+    ).to(device)
+
+    # ── load weights ────────────────────────────────────────────────────────
+    ckpt = safe_torch_load(
+        str(checkpoint_path), map_location=str(device), weights_only=False
+    )
+    state = extract_model_state(ckpt, warn=True)
+    if state is None:
+        raise KeyError(f"No model weights found in checkpoint: {checkpoint_path}")
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(
+            f"[load_model_for_inference] Missing keys ({len(missing)}): {missing[:5]} ..."
+        )
+    if unexpected:
+        print(
+            f"[load_model_for_inference] Unexpected keys ({len(unexpected)}): {unexpected[:5]} ..."
+        )
+
+    model.eval()
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"[load_model_for_inference] Loaded {checkpoint_path}  ({n_params/1e6:.2f} M params)  device={device}"
+    )
+    return model, cfg
 
 
 def inference(config, args):
@@ -171,7 +245,7 @@ def inference(config, args):
 
         print(f"[Inference] Loading: {ckpt_path}")
         ckpt = safe_torch_load(ckpt_path, map_location=device, weights_only=True)
-        state_dict = ckpt.get("ema", ckpt.get("model"))
+        state_dict = extract_model_state(ckpt, warn=True)
         if state_dict is None:
             raise KeyError(f"No model weights found in checkpoint: {ckpt_path}")
         model.load_state_dict(state_dict)

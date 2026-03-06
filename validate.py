@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from models.gmti_net import GMTINet
 from datasets.ntire_dataset import NTIREDataset
+from utils.io import safe_torch_load, extract_model_state
 
 try:
     from pytorch_msssim import ssim as compute_ssim
@@ -75,13 +76,10 @@ def validate(config, args):
         )
 
     if os.path.exists(ckpt_path):
-        # Use the safe loader helper which prefers weights-only loads when
-        # available but falls back to full loads on older torch versions.
-        from utils.io import safe_torch_load
+        from utils.io import safe_torch_load, extract_model_state
 
         ckpt = safe_torch_load(ckpt_path, map_location=device, weights_only=True)
-        # Prioritize EMA weights for validation
-        state_dict = ckpt.get("ema", ckpt.get("model"))
+        state_dict = extract_model_state(ckpt, warn=True)
         if state_dict is not None:
             model.load_state_dict(state_dict)
         else:
@@ -96,8 +94,25 @@ def validate(config, args):
 
     psnr_values = []
     ssim_values = []
+    lpips_values = []
+
+    # Init LPIPS
+    loss_fn_vgg = None
+    try:
+        import lpips
+
+        loss_fn_vgg = lpips.LPIPS(net="vgg").to(device)
+        loss_fn_vgg.eval()
+    except ImportError:
+        print(
+            "[Warning] lpips not installed. Run `pip install lpips`. LPIPS will not be computed."
+        )
+
+    # CSV headers
+    val_results = []
 
     with torch.no_grad():
+        # Adjust dataset to return paths if possible, else just keep counter
         for i, (L, M, R) in enumerate(tqdm(val_loader, desc="Validating")):
             L = L.to(device)
             M = M.to(device)
@@ -110,11 +125,24 @@ def validate(config, args):
             psnr_values.append(psnr)
 
             # SSIM
+            ssim_val = float("nan")
             if HAS_MSSSIM:
                 ssim_val = compute_ssim(
                     pred, M, data_range=1.0, size_average=True
                 ).item()
                 ssim_values.append(ssim_val)
+
+            # LPIPS
+            lpips_val = float("nan")
+            if loss_fn_vgg is not None:
+                # LPIPS expects [-1, 1] range
+                pred_scaled = pred * 2.0 - 1.0
+                M_scaled = M * 2.0 - 1.0
+                lpips_val = loss_fn_vgg(pred_scaled, M_scaled).item()
+                lpips_values.append(lpips_val)
+
+            frame_name = f"{i:04d}"
+            val_results.append((frame_name, psnr, ssim_val, lpips_val))
 
     # Report results
     avg_psnr = np.mean(psnr_values)
@@ -125,15 +153,29 @@ def validate(config, args):
     if ssim_values:
         avg_ssim = np.mean(ssim_values)
         print(f"  SSIM:  {avg_ssim:.4f} (±{np.std(ssim_values):.4f})")
+    if lpips_values:
+        avg_lpips = np.mean(lpips_values)
+        print(f"  LPIPS: {avg_lpips:.4f} (±{np.std(lpips_values):.4f})")
     print(f"  Min PSNR: {np.min(psnr_values):.3f}")
     print(f"  Max PSNR: {np.max(psnr_values):.3f}")
     print(f"{'=' * 50}")
+
+    # Save CSV
+    if args.outdir:
+        os.makedirs(args.outdir, exist_ok=True)
+        csv_path = os.path.join(args.outdir, "val_summary.csv")
+        with open(csv_path, "w") as f:
+            f.write("frame,PSNR,SSIM,LPIPS\n")
+            for frame_tgt, p, s, l in val_results:
+                f.write(f"{frame_tgt},{p:.4f},{s:.4f},{l:.4f}\n")
+        print(f"Saved validation summary to {csv_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="GMTI-Net Validation")
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--outdir", type=str, default=None)
     args = parser.parse_args()
 
     with open(args.config, "r") as f:

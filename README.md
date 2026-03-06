@@ -1,6 +1,23 @@
 # GMTI-Net VFI
 
-This repository implements **GMTI-Net**, a state-of-the-art Video Frame Interpolation (VFI) system. The implementation has been rigorously optimized for stable, single-GPU training, robust performance on the NTIRE dataset, and features a clean Window Transformer Fusion & Global Correlation pipeline.
+**GMTI-Net** (Global Motion-guided Transformer Interpolation Network) — state-of-the-art Video Frame Interpolation for the NTIRE 2026 Challenge.
+
+---
+
+## ⚡ Quick Smoke Test (no dataset needed)
+
+```bash
+pip install -r requirements.txt
+python -c "
+import torch
+from models.gmti_net import GMTINet
+m = GMTINet(swin_depth=2, swin_heads=4, transformer_blocks=2, transformer_dim=64).eval()
+L, R = torch.rand(1,3,128,128), torch.rand(1,3,128,128)
+with torch.no_grad():
+    pred = m.inference(L, R)
+print('Output shape:', pred.shape, '| NaN:', torch.isnan(pred).any().item())
+"
+```
 
 ---
 
@@ -8,31 +25,17 @@ This repository implements **GMTI-Net**, a state-of-the-art Video Frame Interpol
 
 ### 1. Requirements
 
-Ensure you have Python 3.9+ and CUDA 11.8+ installed.
+Python 3.9+, CUDA 11.8+ (or CPU fallback).
 
 ```bash
-# Clone the repository and cd into it
-# Create a virtual environment
 python -m venv venv
-# Activate the environment
-source venv/bin/activate  # On Windows use: venv\Scripts\activate
-
-# Install dependencies
+source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Compatibility note
-
-PyTorch 2.6 changed the default behavior of torch.load to be "weights-only" which
-restricts unpickling to tensors and a small safe-list of globals. This repository
-is defensive and requests weights-only loads when only model weights are required,
-and explicitly requests full checkpoint loading when resuming training (to restore
-optimizer/scaler/RNG state). For reproducible runs you can pin a tested version
-such as `torch==2.5.1` in your environment. See `requirements.txt` for guidance.
+> **PyTorch ≥ 2.6 note**: `torch.load` defaults to `weights_only=True`. The codebase uses `utils.io.safe_torch_load` which handles this transparently. Pin `torch==2.5.1` for maximum reproducibility.
 
 ### 2. Dataset Setup
-
-Extract the NTIRE dataset. Make sure the structure looks like:
 
 ```text
 data/
@@ -44,89 +47,203 @@ data/
     ...
 ```
 
-Update `config.yaml` to point to your `train` and `val` directories.
+Edit `config.yaml` → `data.train_dir` / `data.val_dir`.
 
-### 3. Training & Validation
+For multi-dataset pretraining (Section 12 of the system spec):
 
-To start training with the optimized pipeline (GMFlow correlation, deepcopy EMA, strict gradient clipping, Amp):
+```python
+from datasets import NTIREDataset, Vimeo90KDataset, Adobe240Dataset, MixedDataset
+from torch.utils.data import DataLoader
 
-```bash
-python train.py --config config.yaml
+ntire  = NTIREDataset("data/ntire/train",  mode="train", crop_size=256)
+vimeo  = Vimeo90KDataset("data/vimeo",     split="train", crop_size=256)
+adobe  = Adobe240Dataset("data/adobe240",  split="train", crop_size=256)
+
+mixed, sampler = MixedDataset.build(
+    datasets=[vimeo, adobe, ntire],
+    weights=[0.50, 0.30, 0.20],   # exact proportions via WeightedRandomSampler
+    num_samples=100_000,
+)
+loader = DataLoader(mixed, batch_size=16, sampler=sampler, drop_last=True)
 ```
 
-**Features during training:**
-
-- Checkpoints (incl. EMA shadow weights) are saved to `checkpoints/`.
-- Training metrics (Loss, exact PSNR, Gradient Norm) stream to TensorBoard (`logs/`).
-- Flow debug visualization grids are saved to `visualizations/iter_XXXX000.jpg` every 1,000 steps to detect silent failures (e.g. ghosting, pure black flows).
-
-To strictly evaluate a checkpoint (which uses EMA weights by default):
+### 3. Training
 
 ```bash
-python validate.py --config config.yaml --checkpoint checkpoints/best_model.pth
+# Dev run (fast, single GPU)
+bash scripts/launch.sh light
+
+# NTIRE full run (see config knobs below first)
+bash scripts/launch.sh full
+
+# Resume from checkpoint
+bash scripts/launch.sh resume checkpoints/latest.pth
+
+# Debug (deterministic, frequent visualisations)
+bash scripts/launch.sh debug
 ```
 
-To run inference predicting an intermediate test frame:
+Or directly:
 
 ```bash
-# L.png and R.png are the left and right context frames
-python inference.py --left L.png --right R.png --output M_pred.png --checkpoint checkpoints/best_model.pth
+python train.py --config config.yaml [--max_iters N] [--resume PATH] [--deterministic] [--debug]
+```
+
+### 4. Validation & Inference
+
+```bash
+python validate.py --config config.yaml --checkpoint checkpoints/best_ema.pth
+
+# Full NTIRE submission pipeline (checkpoint avg + self-ensemble + multi-scale)
+bash scripts/submit.sh val submission 5
 ```
 
 ---
 
 ## ☁️ Running on Google Colab
 
-The project is natively compatible with Google Colab's standard T4 or A100 environments.
-
-### Step-by-Step
-
-1. Zip your project folder (`GMTI-Net.zip`) and upload it to your Google Drive.
-2. Open a new Notebook on Google Colab, and change your runtime type to **T4 GPU** or higher.
-3. Run the following cells in order:
-
-**Cell 1: Mount Google Drive**
+### Cell 1 — Mount Drive & set up
 
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
-```
-
-**Cell 2: Copy and Extract the Project**
-
-```python
-# Assuming you uploaded GMTI-Net.zip to the root of your Google Drive
 !cp "/content/drive/MyDrive/GMTI-Net.zip" .
 !unzip -q GMTI-Net.zip -d GMTI-Net
 %cd GMTI-Net
+!pip install -r requirements.txt -q
 ```
 
-**Cell 3: Install Dependencies**
+### Cell 2 — Smoke test
 
 ```python
-# PyTorch is pre-installed in Colab, but you need a few extras
-!pip install -r requirements.txt
+!python -c "
+import torch; from models.gmti_net import GMTINet
+m = GMTINet(swin_depth=2, swin_heads=4, transformer_blocks=2, transformer_dim=64).eval()
+L, R = torch.rand(1,3,128,128), torch.rand(1,3,128,128)
+with torch.no_grad(): pred = m.inference(L, R)
+print('OK — shape:', pred.shape)
+"
 ```
 
-**Cell 4: Run Training**
+### Cell 3 — Run tests
 
 ```python
-# Note: You can upload your dataset zip to Drive and extract it here too.
-# Edit config.yaml beforehand or use sed commands to patch paths if needed.
-!python train.py --config config.yaml
+!pytest tests/ -v --tb=short
 ```
 
-**Cell 5: Monitor Progress (TensorBoard in Colab)**
+### Cell 4 — Train
+
+```python
+!python train.py --config config.yaml --max_iters 10000
+```
+
+### Cell 5 — TensorBoard
 
 ```python
 %load_ext tensorboard
 %tensorboard --logdir logs
 ```
 
-**Bonus: Zip Checkpoints / Visualizations automatically to your drive**
+### Cell 6 — Back up to Drive
 
 ```python
-# Safely copy artifacts back to permanent storage!
 !cp -r checkpoints "/content/drive/MyDrive/GMTI-Net-Checkpoints"
 !cp -r visualizations "/content/drive/MyDrive/GMTI-Net-Visualizations"
+!cp logs/run_info.json "/content/drive/MyDrive/GMTI-Net-run_info.json"
+```
+
+---
+
+## ⚙️ Configuration Knobs
+
+| Key                         | Default                     | Description                                                        |
+| --------------------------- | --------------------------- | ------------------------------------------------------------------ |
+| `model.encoder.swin_depth`  | **2** (dev) / **4** (NTIRE) | Swin Transformer depth. Set to 4 for full-quality                  |
+| `model.encoder.swin_heads`  | **4** (dev) / **6** (NTIRE) | Swin heads. Set to 6 when swin_depth=4                             |
+| `training.proj_dim`         | 128                         | Correlation feature projection dim. ↑ = better matching, more VRAM |
+| `training.corr_chunk_size`  | 1024                        | Rows per chunk in GMFlowMatching. ↓ on OOM                         |
+| `training.corr_temp`        | 0.1                         | Softmax temperature. Try 0.05–0.20                                 |
+| `training.corr_topk`        | null                        | Future top-k correlation. null = disabled                          |
+| `training.accumulate_steps` | 4                           | Gradient accumulation. **LR is kept constant** regardless          |
+| `training.amp`              | true                        | AMP mixed precision. Disabled automatically on CPU                 |
+| `training.ema_decay`        | 0.9999                      | EMA model shadow decay                                             |
+| `inference.multiscale`      | [1.0, 1.25]                 | Scales for multi-scale test-time inference                         |
+| `inference.checkpoint_avg`  | 5                           | Number of last checkpoints to average at inference                 |
+
+### Light Dev vs NTIRE Full Run
+
+| Setting      | Light Dev   | NTIRE Full            |
+| ------------ | ----------- | --------------------- |
+| `swin_depth` | 2           | **4**                 |
+| `swin_heads` | 4           | **6**                 |
+| `max_iters`  | 50 000      | **300 000**           |
+| GPU          | 1× RTX 3090 | 4× RTX 4090 / 2× A100 |
+| Crop size    | 256         | 256 → 512 (staged)    |
+
+---
+
+## 🔬 Determinism
+
+```bash
+python train.py --deterministic
+```
+
+Forces `cudnn.deterministic=True` and `cudnn.benchmark=False`. Expect **10–20% throughput reduction** on convolution-heavy ops. Use for debugging or exact reproducibility testing only.
+
+---
+
+## 🧪 Running Tests
+
+```bash
+pytest tests/ -v
+```
+
+| Test file                       | Covers                                                       |
+| ------------------------------- | ------------------------------------------------------------ |
+| `test_correlation.py`           | GMFlow matching, shapes, no NaN                              |
+| `test_warping.py`               | Backward warp, no NaN                                        |
+| `test_forward.py`               | Full model forward, output shape                             |
+| `test_flow_to_grid_and_warp.py` | Grid generation correctness                                  |
+| `test_numeric_bounds.py`        | Chunking parity, convex channel assert, occlusion modes      |
+| `test_smoke_train_resume.py`    | 2-iter train, checkpoint, resume                             |
+| `test_average_checkpoints.py`   | Checkpoint averaging math                                    |
+| `test_occlusion_eval_train.py`  | Eval uses only learned mask; train uses geometric modulation |
+| `test_checkpoint_resume.py`     | Full round-trip: optimizer, scheduler, scaler, RNG           |
+| `test_scaler_saved.py`          | GradScaler state persistence                                 |
+| `test_mixed_dataset.py`         | MixedDataset proportions, deterministic sampling             |
+| `test_datasets.py`              | Vimeo90K + Adobe240 item shapes, value ranges                |
+
+---
+
+## 📁 Repository Layout
+
+```text
+models/
+  encoder.py          Hybrid CNN + Swin encoder
+  flow_estimator.py   GMFlow correlation, convex upsample, middle flow
+  warping.py          Backward warp (fp32-guarded) + dual warping
+  occlusion.py        Occlusion CNN + geometric mask
+  transformer.py      Motion-guided window transformer fusion
+  decoder.py          Frequency-aware decoder + Laplacian merge
+  gmti_net.py         Full model assembly
+
+losses/
+  reconstruction.py   Charbonnier + Laplacian pyramid
+  flow_losses.py      Warping + bidirectional + smoothness + CombinedLoss
+
+datasets/
+  ntire_dataset.py    NTIRE triplet dataset
+  vimeo90k.py         Vimeo-90K triplet dataset
+  adobe240.py         Adobe-240FPS triplet dataset
+  mixed.py            MixedDataset (WeightedRandomSampler)
+
+utils/
+  io.py               safe_torch_load + extract_model_state helpers
+
+train.py              Training loop (EMA, AMP, env logging, determinism)
+validate.py           Evaluation (PSNR, SSIM)
+inference.py          Full inference pipeline (self-ensemble, multi-scale)
+config.yaml           All hyperparameters
+scripts/launch.sh     Local launch (light / full / resume / debug / smoke)
+scripts/submit.sh     NTIRE submission pipeline
 ```

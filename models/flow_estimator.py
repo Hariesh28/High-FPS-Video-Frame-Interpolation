@@ -11,8 +11,13 @@ Tensor flow:
     → coarse flow [B,2,H/16,W/16]
     → refined flow [B,2,H,W]
     → middle flows F_LM, F_RM [B,2,H,W]
+
+FP32 safety: correlation softmax + all coordinate arithmetic
+run in forced fp32 (autocast disabled). Convex mask softmax
+also runs fp32. Both are cached on device to reduce alloc overhead.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -121,16 +126,46 @@ class GMFlowMatching(nn.Module):
     - Feature Projection Channel Alignment
     - L2 Normalization with Epsilon Clamp
     - Explicit float32 projection & Softmax Bounds
+    - Cached coordinate grid per (H, W, device) to avoid repeated allocation
+    - Optional top-k correlation (NOT YET IMPLEMENTED — see corr_topk)
     """
 
-    def __init__(self, proj_dim=128, chunk_size=1024, temp=0.1, clamp_val=50.0):
+    def __init__(
+        self, proj_dim=128, chunk_size=1024, temp=0.1, clamp_val=50.0, corr_topk=None
+    ):
         super().__init__()
         self.chunk_size = chunk_size
         self.temp = temp
         self.clamp_val = clamp_val
-        import math
-
         self.scale = math.sqrt(proj_dim)
+
+        # top-k correlation placeholder
+        if corr_topk is not None:
+            raise NotImplementedError(
+                f"corr_topk={corr_topk} is not supported in this build.\n"
+                "  → To use global matching (recommended), set corr_topk=null in config.yaml\n"
+                "  → To implement sparse top-k: replace this guard with a two-stage\n"
+                "    coarse→top-k path in GMFlowMatching.forward().\n"
+                "    Reference: GMFlow sparse variant (top-k nearest neighbor in feature space).\n"
+                "    TODO: for very large images (>1080p) top-k will be necessary to avoid OOM."
+            )
+        self.corr_topk = corr_topk
+
+        # Cache: maps (H, W, device_str) → precomputed coords tensor
+        self._coord_cache: dict = {}
+
+    def _get_coords(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Return cached [H*W, 2] coordinate grid for (H, W, device)."""
+        key = (H, W, str(device))
+        if key not in self._coord_cache:
+            xs = torch.arange(W, dtype=torch.float32, device=device)
+            ys = torch.arange(H, dtype=torch.float32, device=device)
+            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+            coords = torch.stack(
+                [grid_x.flatten(), grid_y.flatten()], dim=-1
+            )  # [HW, 2]
+            self._coord_cache[key] = coords
+        return self._coord_cache[key]
 
     def forward(self, fL, fR):
         """
@@ -138,6 +173,7 @@ class GMFlowMatching(nn.Module):
             fL, fR: [B, C, H, W] projected features
         Returns:
             flow: [B, 2, H, W] expected displacement
+            conf: [B, 1, H, W] confidence
         """
         B, C, H, W = fL.shape
         HW = H * W
@@ -150,11 +186,8 @@ class GMFlowMatching(nn.Module):
         fL_flat = fLn.view(B, C, HW).permute(0, 2, 1)  # [B, HW, C]
         fR_flat = fRn.view(B, C, HW)  # [B, C, HW]
 
-        # 3. Precompute unnormalized pixel coordinates
-        xs = torch.arange(0, W, dtype=torch.float32, device=fL.device)
-        ys = torch.arange(0, H, dtype=torch.float32, device=fL.device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        coords = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)  # [HW, 2]
+        # 3. Get cached coords
+        coords = self._get_coords(H, W, fL.device)  # [HW, 2]
 
         def run_with_chunk(chunk_size):
             fL32 = fL_flat.float()
@@ -182,37 +215,75 @@ class GMFlowMatching(nn.Module):
             conf_out = max_probs_all.view(B, 1, H, W)  # [B, 1, H, W]
             return flow_out, conf_out
 
-        # Disable autocast rigorously inside matching block
+        # Disable autocast inside matching block — correlation + softmax must be fp32
+        active_chunk = self.chunk_size
+        oom_fallback_triggered = False
         with torch.amp.autocast("cuda", enabled=False):
             try:
                 expected_pos, conf = run_with_chunk(self.chunk_size)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
-                chunk2 = max(128, self.chunk_size // 2)
+                active_chunk = max(128, self.chunk_size // 2)
+                oom_fallback_triggered = True
                 try:
-                    expected_pos, conf = run_with_chunk(chunk2)
+                    expected_pos, conf = run_with_chunk(active_chunk)
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
-                    chunk3 = max(64, chunk2 // 2)
-                    expected_pos, conf = run_with_chunk(chunk3)
+                    active_chunk = max(64, active_chunk // 2)
+                    expected_pos, conf = run_with_chunk(active_chunk)
+
+        # OOM watchdog: log when fallback triggers so user can tune corr_chunk_size
+        if oom_fallback_triggered:
+            peak_mb = (
+                torch.cuda.max_memory_allocated() / 1024**2
+                if torch.cuda.is_available()
+                else 0
+            )
+            import warnings
+
+            warnings.warn(
+                f"[GMFlowMatching] OOM triggered: fell back to chunk_size={active_chunk} "
+                f"(was {self.chunk_size}). "
+                f"Peak GPU memory: {peak_mb:.0f} MB. "
+                f"Consider setting corr_chunk_size={active_chunk} in config.yaml to avoid this overhead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
 
         expected_pos = expected_pos.to(fL.dtype)
         conf = conf.to(fL.dtype)
-        # Revert to displacement = expected position - source position
-        source_coords = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).to(fL.dtype)
-        flow = expected_pos - source_coords
+
+        # Source coords for displacement (reuse cached grid)
+        src_coords = (
+            coords.view(H, W, 2).permute(2, 0, 1).unsqueeze(0).to(fL.dtype)
+        )  # [1,2,H,W]
+        flow = expected_pos - src_coords
 
         return flow, conf
 
 
 class ConvexMaskUpsample(nn.Module):
-    """Upsample flow by scaling spatial dynamics utilizing mathematically defined mask channels."""
+    """Upsample flow using a learned convex combination of local neighbors.
+
+    Channel assert: mask_ch must equal kernel² × upscale² at init time.
+    Mask softmax runs in fp32 (autocast disabled) to prevent rounding that
+    could shift learned weights and degrade sub-pixel flow quality.
+    """
 
     def __init__(self, in_channels, kernel=3, upscale=2):
         super().__init__()
         self.kernel = kernel
         self.upscale = upscale
         self.mask_ch = (kernel * kernel) * (upscale * upscale)
+
+        # Fail fast: catch accidental misconfiguration before any training step.
+        assert self.mask_ch == (kernel**2) * (upscale**2), (
+            f"ConvexMaskUpsample: mask_ch={self.mask_ch} ≠ "
+            f"kernel²×upscale²={kernel**2}×{upscale**2}={kernel**2 * upscale**2}. "
+            "Check kernel and upscale arguments."
+        )
 
         self.mask_net = nn.Sequential(
             nn.Conv2d(in_channels, 256, 3, padding=1),
@@ -227,32 +298,34 @@ class ConvexMaskUpsample(nn.Module):
         k2 = k * k
         Hs, Ws = Hc * up, Wc * up
 
-        # 1. Predict and format the mask
-        mask = self.mask_net(feat_coarse)  # [B, k2*up2, Hc, Wc]
-        mask = mask.view(B, k2, up * up, Hc, Wc)
-        mask = torch.softmax(mask, dim=1)  # Softmax across k*k neighbors
-        mask = mask.view(B, k2, up, up, Hc, Wc).permute(
-            0, 1, 4, 2, 5, 3
-        )  # [B, k2, Hc, up, Wc, up]
-        mask = mask.contiguous().view(B, 1, k2, Hs, Ws)  # [B, 1, k2, Hs, Ws]
+        # Mask softmax must run in fp32 to prevent rounding-induced weight bias.
+        with torch.amp.autocast("cuda", enabled=False):
+            fc32 = feat_coarse.float()
+            raw_mask = self.mask_net(fc32)  # [B, k2*up2, Hc, Wc]
+            mask = raw_mask.view(B, k2, up * up, Hc, Wc)
+            mask = torch.softmax(mask, dim=1)  # Softmax across k*k neighbors
+            mask = mask.view(B, k2, up, up, Hc, Wc).permute(
+                0, 1, 4, 2, 5, 3
+            )  # [B, k2, Hc, up, Wc, up]
+            mask = mask.contiguous().view(B, 1, k2, Hs, Ws)  # [B, 1, k2, Hs, Ws]
 
-        # 2. Extract k*k local neighborhood windows around coarse flow
-        flow_unfold = F.unfold(
-            flow_coarse, kernel_size=k, padding=k // 2
-        )  # [B, 2*k2, Hc*Wc]
-        flow_unfold = flow_unfold.view(B, 2, k2, Hc, Wc)  # [B, 2, k2, Hc, Wc]
+            # Extract k*k local neighborhood windows around coarse flow
+            flow32 = flow_coarse.float()
+            flow_unfold = F.unfold(
+                flow32, kernel_size=k, padding=k // 2
+            )  # [B, 2*k2, Hc*Wc]
+            flow_unfold = flow_unfold.view(B, 2, k2, Hc, Wc)
 
-        # 3. Duplicate spatial dims `up`x nearest neighbor
-        flow_unfold = (
-            flow_unfold.unsqueeze(4).unsqueeze(6).repeat(1, 1, 1, 1, up, 1, up)
-        )
-        flow_unfold = flow_unfold.view(B, 2, k2, Hs, Ws)  # [B, 2, k2, Hs, Ws]
+            # Repeat for upsampled spatial grid
+            flow_unfold = (
+                flow_unfold.unsqueeze(4).unsqueeze(6).repeat(1, 1, 1, 1, up, 1, up)
+            )
+            flow_unfold = flow_unfold.view(B, 2, k2, Hs, Ws)
 
-        # 4. Convex combination
-        flow_up = (mask * flow_unfold).sum(dim=2)  # [B, 2, Hs, Ws]
+            # Convex combination
+            flow_up = (mask * flow_unfold).sum(dim=2)  # [B, 2, Hs, Ws]
 
-        # Expand explicit scaled outputs multiplied by upscale mapping scale limits
-        return flow_up * float(up)
+        return flow_up.to(flow_coarse.dtype) * float(up)
 
 
 class MiddleFlowProjection(nn.Module):

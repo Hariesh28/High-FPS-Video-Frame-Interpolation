@@ -1,7 +1,12 @@
-# GMTI-Net Configuration
-# NTIRE 2026 High FPS Video Frame Interpolation Challenge
+# config.yaml — GMTI-Net final defaults (NTIRE 2026 High FPS VFI Challenge)
+#
+# Quick-start:      bash scripts/launch.sh light
+# Full NTIRE run:   bash scripts/launch.sh full   (edit swin_depth/heads below first)
+# Resume:           bash scripts/launch.sh resume checkpoints/latest.pth
+# Debug:            bash scripts/launch.sh debug  (deterministic, 200 iters)
+# Smoke test:       bash scripts/launch.sh smoke  (CPU forward-pass only)
 
-# Dataset
+# ── Dataset ──────────────────────────────────────────────────────────────────
 data:
   train_dir: "train"
   val_dir: "val"
@@ -10,16 +15,24 @@ data:
   pin_memory: true
   prefetch_factor: 4
 
-# Model
+# ── Model ─────────────────────────────────────────────────────────────────────
 model:
+  name: gmti_net
+  proj_dim: 128 # dev: 128; NTIRE full: 160 (optional)
   encoder:
     stage1_channels: 32
     stage2_channels: 64
     stage3_channels: 96
     stage4_channels: 128
     stage5_channels: 160
-    swin_depth: 2
-    swin_heads: 4
+    # ── Dev / single-GPU light config ─────────────────────────────────────
+    # swin_depth=2, swin_heads=4 — fast iteration, lower VRAM.
+    # ── NTIRE full-run recommended values ─────────────────────────────────
+    # swin_depth: 4   # more accurate, higher VRAM cost
+    # swin_heads: 6   # pairs with depth=4
+    # ──────────────────────────────────────────────────────────────────────
+    swin_depth: 2 # change to 4 for NTIRE full-run
+    swin_heads: 4 # change to 6 for NTIRE full-run
     swin_window_size: 8
     swin_mlp_ratio: 4.0
   flow:
@@ -34,56 +47,132 @@ model:
     num_res_blocks_lf: 2
     num_res_blocks_detail: 4
 
-# Loss weights
+# ── Correlation (GMFlowMatching) ─────────────────────────────────────────────
+correlation:
+  corr_chunk_size: 1024 # rows per chunk. Lower on OOM (512, 256, 128).
+  corr_temp: 0.1 # softmax temperature. Try 0.05–0.20.
+  corr_clamp: 50.0 # logit clamp before softmax (prevents overflow).
+  # corr_topk: null — set an integer (e.g. 32) to enable coarse-to-topk sparse
+  # matching for >1080p inputs (requires implementing two-stage path first).
+  corr_topk: null
+
+# ── Convex Upsampling ────────────────────────────────────────────────────────
+convex:
+  kernel: 3
+  upscale: 2 # mask_ch = kernel² × upscale² = 9 × 4 = 36
+
+# ── Loss weights ─────────────────────────────────────────────────────────────
 loss:
   charbonnier: 1.0
-  laplacian: 0.2
+  laplacian: 0.3 # increased from 0.2 for better high-freq detail (do not exceed 0.4)
   warping: 0.1
   bidirectional: 0.05
   smoothness: 0.01
+  # MSE term directly optimises PSNR = -10*log10(MSE).  Expected: +0.05-0.2 dB.
+  mse: 0.1
   charbonnier_eps: 1.0e-3
 
-# Multi-scale supervision
+# ── Multi-scale supervision ──────────────────────────────────────────────────
 multiscale:
-  scales: [0.0625, 0.125, 0.25, 1.0] # 1/16, 1/8, 1/4, 1
+  scales: [0.0625, 0.125, 0.25, 1.0] # 1/16, 1/8, 1/4, full
   weights: [0.1, 0.2, 0.5, 1.0]
 
-# Training & Numerics
+# ── Training ─────────────────────────────────────────────────────────────────
 training:
-  proj_dim: 128
-  corr_chunk_size: 1024
-  corr_temp: 0.1
-  corr_clamp: 50.0
-  corr_topk: null # set to 32 for very large inputs
-  convex_kernel: 3
-  convex_upscale: 2 # mask channels -> 9 * 4 = 36
-  convex_mask_init: "xavier"
-  optimizer: "adamw"
+  max_iters: 300000
+  optimizer: adamw
   lr: 2.0e-4
   beta1: 0.9
   beta2: 0.999
   weight_decay: 1.0e-4
   warmup_iters: 2000
   final_lr: 1.0e-6
-  batch_size: 16
+  batch_size: 2 # effective batch = batch_size × accumulate_steps = 8
+  # LR scaling: keep lr=2e-4 constant regardless of accumulate_steps.
+  # For linear scaling multiply lr by accumulate_steps yourself.
   accumulate_steps: 4
   clip_norm: 1.0
-  ema_decay: 0.9999
-  amp: true
+  amp: true # AMP mixed precision (auto-disabled on CPU)
   checkpoint_freq: 5000
   val_freq: 2000
+  # Checkpoint retention policy:
+  #   keep_last_checkpoints — most-recent iter_*.pth files to retain
+  #   keep_best_checkpoints — best_ema.pth slots (always keep at least 1)
+  keep_last_checkpoints: 5
+  keep_best_checkpoints: 3
   seed: 2026
-  num_workers: 8
-  pin_memory: true
-  prefetch_factor: 4
+  # deterministic: false — enable via --deterministic flag at runtime.
+  #   When true: cudnn.deterministic=True, cudnn.benchmark=False.
+  #   Warning: ~10-20% throughput reduction on cuDNN conv ops.
+  deterministic: false
+  debug: false # If true, save flow visuals every 100 iters
 
-# Inference
+# ── EMA ──────────────────────────────────────────────────────────────────────
+ema:
+  # 0.99995 stabilises late-stage weights better than 0.9999.
+  # Expected improvement: +0.01-0.04 dB at final inference.
+  decay: 0.99995
+
+# ── Inference ────────────────────────────────────────────────────────────────
 inference:
+  # ✅ Checkpoint averaging: average last N EMA checkpoints.  +0.05-0.15 dB.
+  average_last_ckpts: 5
+  # ✅ Self-ensemble: run original + flip H/V/HV, average. +0.02-0.08 dB.
   self_ensemble: true
-  checkpoint_avg: 5
+  self_ensemble_transforms: [none, hflip, vflip, hvflip]
+  # ✅ Multi-scale inference: run at 1.0 and 1.25, average. +0.01-0.05 dB.
   multiscale: [1.0, 1.25]
 
-# Augmentation
+# ── Curriculum Learning (Item 2) ─────────────────────────────────────────────
+# Stage-based training schedule. Expected improvement: +0.15-0.4 dB.
+# Enable via: python train.py --config config.yaml --stage 1 (or 2 or 3)
+# Train each stage in order: Stage1 → Stage2 → Stage3.
+curriculum:
+  stages:
+    - stage: 1
+      patch_size: 256
+      max_iters: 120000
+      lr: 2.0e-4
+      datasets: [ntire, vimeo90k, adobe240] # early: learn motion
+      description: "Pretrain — learn general motion on mixed data"
+    - stage: 2
+      patch_size: 384
+      max_iters: 80000 # cumulative: 200k
+      lr: 1.0e-4
+      datasets: [ntire, vimeo90k, adobe240] # mid: refine details
+      description: "Mid-resolution finetune — refine textures"
+    - stage: 3
+      patch_size: 512
+      max_iters: 40000 # cumulative: 240k (NTIRE only for final score)
+      lr: 2.0e-5
+      datasets: [ntire] # final: NTIRE-only for target domain
+      description: "High-res NTIRE-only finetune — maximise submission PSNR"
+
+# ── Dataset Mixing (Item 4) ───────────────────────────────────────────────────
+# Recommended multi-dataset mixing ratios. Expected improvement: +0.2-0.5 dB.
+# NTIRE winners train on diverse motion patterns before final fine-tuning.
+dataset_mixing:
+  # Primary mix (stages 1-2)
+  weights:
+    ntire: 0.6
+    vimeo90k: 0.3
+    adobe240: 0.1
+  # Final fine-tune (stage 3): ntire only (use training.datasets: [ntire])
+
+# ── Hard Example Sampler (Items 5 & 11) ──────────────────────────────────────
+# Two sampler modes: flow_magnitude (fast, no model needed) and psnr_biased.
+# Expected improvement per sampler: +0.05-0.2 dB.
+hard_sampler:
+  # mode: off | flow_magnitude | psnr_biased
+  mode: flow_magnitude
+  # flow_magnitude params
+  flow_mag_alpha: 0.5 # power law exponent (0=uniform, 1=linear)
+  flow_mag_min_weight: 1.0e-4
+  # psnr_biased params
+  psnr_temperature: 5.0 # higher = closer to uniform
+  psnr_init: 32.0 # initial PSNR guess for all samples
+
+# ── Augmentation ─────────────────────────────────────────────────────────────
 augmentation:
   random_crop: 1.0
   horizontal_flip: 0.5

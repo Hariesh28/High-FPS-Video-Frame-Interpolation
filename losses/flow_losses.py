@@ -4,9 +4,14 @@ GMTI-Net Flow and Combined Losses
 Warping Loss:     ||warp(L, F_LM) - M|| + ||warp(R, F_RM) - M||
 Bidirectional:    ||F_LR + warp(F_RL, F_LR)||
 Flow Smoothness:  |∇F|
+MSE Loss:         MSE(pred, gt)  — directly targets PSNR (-10 log10 MSE)
 
 Combined Loss:
-    L_total = 1.0*charb + 0.2*lap + 0.1*warp + 0.05*bidir + 0.01*smooth
+    L_total = 1.0*charb + 0.3*lap + 0.1*warp + 0.05*bidir + 0.01*smooth + 0.1*mse
+
+    MSE is the only term that directly optimises PSNR.  Setting w_mse ≈ 0.1
+    provides a PSNR-targeted bias without overshadowing perceptual terms.
+    Expected improvement: +0.05–0.2 dB.
 """
 
 import torch
@@ -109,6 +114,21 @@ class FlowSmoothnessLoss(nn.Module):
         return loss
 
 
+class GradientLoss(nn.Module):
+    """Edge-sharpening gradient loss.
+
+    L_grad = ||∇pred - ∇gt||_1
+    """
+
+    def forward(self, pred, gt):
+        # spatial gradients
+        pred_dy = torch.abs(pred[:, :, 1:, :] - pred[:, :, :-1, :])
+        pred_dx = torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1])
+        gt_dy = torch.abs(gt[:, :, 1:, :] - gt[:, :, :-1, :])
+        gt_dx = torch.abs(gt[:, :, :, 1:] - gt[:, :, :, :-1])
+        return F.l1_loss(pred_dy, gt_dy) + F.l1_loss(pred_dx, gt_dx)
+
+
 class CombinedLoss(nn.Module):
     """Combined loss with all components and multi-scale supervision.
 
@@ -124,12 +144,14 @@ class CombinedLoss(nn.Module):
 
     def __init__(
         self,
-        w_charb=1.0,
-        w_lap=0.2,
-        w_warp=0.1,
-        w_bidir=0.05,
-        w_smooth=0.01,
-        charb_eps=1e-3,
+        w_charb: float = 1.0,
+        w_lap: float = 0.3,
+        w_warp: float = 0.02,  # NTIRE Flow Refinement Trick
+        w_bidir: float = 0.05,
+        w_smooth: float = 0.01,
+        w_mse: float = 0.1,  # PSNR-targeted term: PSNR = -10*log10(MSE)
+        w_grad: float = 0.05,  # NTIRE Gradient Loss Trick
+        charb_eps: float = 1e-3,
         multiscale_scales=None,
         multiscale_weights=None,
     ):
@@ -139,15 +161,18 @@ class CombinedLoss(nn.Module):
         self.w_warp = w_warp
         self.w_bidir = w_bidir
         self.w_smooth = w_smooth
+        self.w_mse = w_mse
+        self.w_grad = w_grad
 
         self.charb = CharbonnierLoss(eps=charb_eps)
         self.lap = LaplacianPyramidLoss(num_levels=4)
         self.warp_loss = WarpingLoss()
         self.bidir_loss = BidirectionalFlowLoss()
         self.smooth_loss = FlowSmoothnessLoss()
+        self.grad_loss = GradientLoss()
 
         self.ms_scales = multiscale_scales or [0.0625, 0.125, 0.25, 1.0]
-        self.ms_weights = multiscale_weights or [0.1, 0.2, 0.5, 1.0]
+        self.ms_weights = multiscale_weights or [0.05, 0.2, 0.7, 1.0]
 
     def forward(self, pred, gt, L, R, aux):
         """
@@ -200,6 +225,15 @@ class CombinedLoss(nn.Module):
             + self.smooth_loss(flow_rm)
         ) / 4.0
 
+        # ---- MSE (PSNR-targeted) ----
+        # PSNR = -10*log10(MSE), so minimising MSE directly maximises PSNR.
+        # Operates on the full-resolution prediction only (not multi-scale).
+        # Cast to fp32 to ensure numerical accuracy even under AMP.
+        loss_mse = F.mse_loss(pred.float(), gt.float())
+
+        # ---- Gradient (edges) ----
+        loss_grad = self.grad_loss(pred, gt)
+
         # ---- Total ----
         total = (
             self.w_charb * loss_charb
@@ -207,6 +241,8 @@ class CombinedLoss(nn.Module):
             + self.w_warp * loss_warp
             + self.w_bidir * loss_bidir
             + self.w_smooth * loss_smooth
+            + self.w_mse * loss_mse
+            + self.w_grad * loss_grad
         )
 
         loss_dict = {
@@ -215,6 +251,8 @@ class CombinedLoss(nn.Module):
             "warp": loss_warp.item(),
             "bidir": loss_bidir.item(),
             "smooth": loss_smooth.item(),
+            "mse": loss_mse.item(),
+            "grad": loss_grad.item(),
             "total": total.item(),
         }
 
