@@ -8,8 +8,8 @@
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
 data:
-  train_dir: "train"
-  val_dir: "val"
+  train_dir: "data/NTIRE/train"
+  val_dir: "data/NTIRE/val"
   crop_size: 256
   num_workers: 8
   pin_memory: true

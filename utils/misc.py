@@ -49,6 +49,15 @@ def seed_everything(seed: int = 2026, deterministic: bool = False) -> None:
     torch.backends.cudnn.benchmark = not deterministic
 
 
+def _worker_init_global(worker_id: int, base_seed: int) -> None:
+    worker_seed = int(base_seed) + worker_id
+    import random, numpy as np, torch
+
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
 def make_worker_init_fn(base_seed: int):
     """Return a DataLoader ``worker_init_fn`` that seeds each worker uniquely.
 
@@ -56,14 +65,9 @@ def make_worker_init_fn(base_seed: int):
     across workers is independent but reproducible when ``base_seed`` is fixed.
     This is especially important when ``--deterministic`` is used.
     """
+    import functools
 
-    def _worker_init(worker_id: int) -> None:
-        worker_seed = int(base_seed) + worker_id
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-
-    return _worker_init
+    return functools.partial(_worker_init_global, base_seed=base_seed)
 
 
 # ---------------------------------------------------------------------------
