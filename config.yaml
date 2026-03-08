@@ -11,7 +11,7 @@ data:
   train_dir: "data/NTIRE/train"
   val_dir: "data/NTIRE/val"
   crop_size: 256
-  num_workers: 8
+  num_workers: 0
   pin_memory: true
   prefetch_factor: 4
 

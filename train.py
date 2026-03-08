@@ -330,8 +330,15 @@ def train(config, args):
 
     # ---- Resume checkpoint ----
     start_iter = 0
-    if args.resume and os.path.exists(args.resume):
-        ckpt = safe_torch_load(args.resume, map_location=device, weights_only=False)
+    ckpt = None
+    if args.resume:
+        if os.path.exists(args.resume):
+            print(f"[Train] Resuming from checkpoint: {args.resume}")
+            ckpt = safe_torch_load(args.resume, map_location=device, weights_only=False)
+        else:
+            print(f"[Warning] Checkpoint path not found: {args.resume}")
+
+    if args.resume and ckpt is not None:
 
         state_dict = extract_model_state(ckpt, warn=True)
         if state_dict is None:
