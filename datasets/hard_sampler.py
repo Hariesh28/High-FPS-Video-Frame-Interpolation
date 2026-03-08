@@ -44,7 +44,9 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 
 
 def _frame_diff_magnitude(
-    dataset: Dataset, indices: Optional[Iterable[int]] = None
+    dataset: Dataset,
+    indices: Optional[Iterable[int]] = None,
+    cache_key: Optional[str] = None,
 ) -> np.ndarray:
     """Estimate motion magnitude for each triplet as ||L - R||_2.
 
@@ -55,6 +57,19 @@ def _frame_diff_magnitude(
     Returns: np.ndarray of shape [N] with non-negative magnitudes.
     """
     n = len(dataset)  # type: ignore[arg-type]
+
+    if cache_key:
+        import os
+
+        cache_dir = "checkpoints/hard_sampler_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f"{cache_key}.npy")
+        if os.path.exists(cache_path):
+            print(
+                f"[FlowMagnitudeWeightedSampler] Loaded pre-computed motion proxies from {cache_path}"
+            )
+            return np.load(cache_path)
+
     chosen = list(indices) if indices is not None else range(n)
 
     mags = np.zeros(n, dtype=np.float32)
@@ -65,6 +80,12 @@ def _frame_diff_magnitude(
             mags[i] = float(diff)
         except Exception:
             mags[i] = 0.0
+
+    if cache_key:
+        np.save(cache_path, mags)
+        print(
+            f"[FlowMagnitudeWeightedSampler] Saved computed motion proxies to {cache_path}"
+        )
 
     return mags
 
@@ -98,8 +119,9 @@ class FlowMagnitudeWeightedSampler(WeightedRandomSampler):
         min_weight: float = 1e-4,
         generator: Optional[torch.Generator] = None,
     ):
-        print(f"[FlowMagnitudeWeightedSampler] Computing motion proxies for {len(dataset)} samples …")  # type: ignore[arg-type]
-        mags = _frame_diff_magnitude(dataset)
+        cache_key = f"flow_mag_{dataset.__class__.__name__}_{len(dataset)}"
+        print(f"[FlowMagnitudeWeightedSampler] Computing/Loading motion proxies for {len(dataset)} samples …")  # type: ignore[arg-type]
+        mags = _frame_diff_magnitude(dataset, cache_key=cache_key)
 
         # Apply power law, clip extreme values, and add floor
         weights = np.clip(mags**alpha, 0.0, 5.0) + min_weight
