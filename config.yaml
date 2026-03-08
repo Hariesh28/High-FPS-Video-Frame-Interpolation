@@ -18,7 +18,7 @@ data:
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
   name: gmti_net
-  proj_dim: 128 # dev: 128; NTIRE full: 160 (optional)
+  proj_dim: 160 # dev: 128; NTIRE full: 160 (optional)
   encoder:
     stage1_channels: 32
     stage2_channels: 64
@@ -50,7 +50,7 @@ model:
 # ── Correlation (GMFlowMatching) ─────────────────────────────────────────────
 correlation:
   corr_chunk_size: 1024 # rows per chunk. Lower on OOM (512, 256, 128).
-  corr_temp: 0.1 # softmax temperature. Try 0.05–0.20.
+  corr_temp: 0.08 # softmax temperature. Try 0.05–0.20.
   corr_clamp: 50.0 # logit clamp before softmax (prevents overflow).
   # corr_topk: null — set an integer (e.g. 32) to enable coarse-to-topk sparse
   # matching for >1080p inputs (requires implementing two-stage path first).
@@ -84,10 +84,10 @@ training:
   lr: 2.0e-4
   beta1: 0.9
   beta2: 0.999
-  weight_decay: 1.0e-4
+  weight_decay: 0.999e-4
   warmup_iters: 2000
   final_lr: 1.0e-6
-  batch_size: 2 # effective batch = batch_size × accumulate_steps = 8
+  batch_size: 1 # effective batch = batch_size × accumulate_steps = 8
   # LR scaling: keep lr=2e-4 constant regardless of accumulate_steps.
   # For linear scaling multiply lr by accumulate_steps yourself.
   accumulate_steps: 4
@@ -111,7 +111,7 @@ training:
 ema:
   # 0.99995 stabilises late-stage weights better than 0.9999.
   # Expected improvement: +0.01-0.04 dB at final inference.
-  decay: 0.99995
+  decay: 0.999
 
 # ── Inference ────────────────────────────────────────────────────────────────
 inference:
