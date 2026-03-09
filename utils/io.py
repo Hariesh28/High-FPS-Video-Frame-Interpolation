@@ -10,10 +10,13 @@ Provides:
 import glob
 import os
 import re
+import logging
 import warnings
 from typing import Any, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def safe_torch_load(
@@ -99,19 +102,20 @@ def extract_model_state(
 
 
 def atomic_save(obj: Any, path: str) -> None:
-    """Save ``obj`` to a temporary file then atomically rename to ``path``.
+    """Save ``obj`` to a temporary file then atomically rename to ``path``."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
-    This prevents partial / corrupt checkpoints if the process is killed
-    mid-write.  The temporary file lives alongside the target so the rename
-    is guaranteed to be on the same filesystem.
-
-    Args:
-        obj:  Any picklable object (e.g., a checkpoint dict).
-        path: Final destination path.
-    """
     tmp = path + ".tmp"
-    torch.save(obj, tmp)
-    os.replace(tmp, path)
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    except Exception as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        logger.error(f"Failed to save {path}: {e}")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +148,6 @@ def prune_checkpoints(ckpt_dir: str = "checkpoints", keep_last: int = 5) -> None
     for path in to_delete:
         try:
             os.remove(path)
-            print(f"[io] Pruned checkpoint: {os.path.basename(path)}")
+            logger.info(f"Pruned checkpoint: {os.path.basename(path)}")
         except OSError as exc:
-            warnings.warn(f"[io] Could not prune {path}: {exc}")
+            logger.warning(f"Could not prune {path}: {exc}")

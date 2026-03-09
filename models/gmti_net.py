@@ -17,6 +17,8 @@ Forward pass:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
+from typing import Dict, Any, Tuple, Optional
 
 from .encoder import HybridEncoder
 from .flow_estimator import FlowEstimator
@@ -24,6 +26,8 @@ from .warping import DualWarping, backward_warp
 from .occlusion import OcclusionNetwork
 from .transformer import TransformerFusion
 from .decoder import FrequencyAwareDecoder
+
+logger = logging.getLogger(__name__)
 
 
 class GMTINet(nn.Module):
@@ -85,14 +89,23 @@ class GMTINet(nn.Module):
         # Frequency-aware decoder
         self.decoder = FrequencyAwareDecoder(in_channels=transformer_dim)
 
-    def forward(self, L, R):
+        logger.info(
+            f"GMTI-Net initialized with {encoder_channels} encoder channels, "
+            f"swin_depth={swin_depth}, transformer_blocks={transformer_blocks}"
+        )
+
+    def forward(
+        self, L: torch.Tensor, R: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
+        Execute the full GMTI-Net forward pass.
+
         Args:
-            L: [B, 3, H, W] left frame (t=0)
-            R: [B, 3, H, W] right frame (t=1)
+            L (torch.Tensor): Left input frame [B, 3, H, W] at t=0.
+            R (torch.Tensor): Right input frame [B, 3, H, W] at t=1.
+
         Returns:
-            pred: [B, 3, H, W] predicted middle frame (t=0.5)
-            aux: dict with intermediate outputs for loss computation
+            Tuple: (predicted_frame [B, 3, H, W], auxiliary_data_dict).
         """
         # Ensure input dimensions are divisible by 16 (for encoder)
         B, C, H, W = L.shape
@@ -159,7 +172,16 @@ class GMTINet(nn.Module):
 
         return pred, aux
 
-    def inference(self, L, R):
-        """Simple inference: returns only the predicted frame."""
+    def inference(self, L: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+        """
+        Run inference only, returning the interpolated frame.
+
+        Args:
+            L (torch.Tensor): Left input frame [B, 3, H, W].
+            R (torch.Tensor): Right input frame [B, 3, H, W].
+
+        Returns:
+            torch.Tensor: Interpolated middle frame [B, 3, H, W].
+        """
         pred, _ = self.forward(L, R)
         return pred

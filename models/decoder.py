@@ -14,12 +14,18 @@ Output: [B, 3, H, W] reconstructed frame
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple
 
 
 class ResBlock(nn.Module):
-    """Residual block: Conv→GN→GELU→Conv→GN + skip."""
+    """
+    Residual block with GroupNorm and GELU.
 
-    def __init__(self, channels):
+    Attributes:
+        channels (int): Number of input/output channels.
+    """
+
+    def __init__(self, channels: int):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.gn1 = nn.GroupNorm(8, channels)
@@ -69,13 +75,15 @@ class LowFrequencyBranch(nn.Module):
             nn.Conv2d(32, 3, 3, padding=1),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Execute progressive upsampling for low-frequency content.
+
         Args:
-            x: [B, 128, H/4, W/4]
+            x (torch.Tensor): Latent features [B, 128, H/4, W/4].
+
         Returns:
-            low_freq: [B, 3, H, W]
-            feat: [B, 64, H, W] intermediate features for skip connection
+            Tuple[torch.Tensor, torch.Tensor]: (low_freq_rgb, spatial_features).
         """
         # H/4 → H/2
         x = self.up1(x)
@@ -117,12 +125,15 @@ class HighFrequencyBranch(nn.Module):
             nn.Conv2d(32, 3, 3, padding=1),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Predict high-frequency detail residuals.
+
         Args:
-            x: [B, 128, H/4, W/4]
+            x (torch.Tensor): Latent features [B, 128, H/4, W/4].
+
         Returns:
-            detail: [B, 3, H, W] high-frequency detail residual
+            torch.Tensor: Detail residual [B, 3, H, W].
         """
         edge = self.edge_net(x)  # [B, 1, H/4, W/4]
         detail = self.detail_net(torch.cat([x, edge], dim=1))  # [B, 3, H/4, W/4]
@@ -179,12 +190,15 @@ class FrequencyAwareDecoder(nn.Module):
         self.high_freq = HighFrequencyBranch(in_channels)
         self.detail_refine = DetailRefinementHead(in_channels=67)  # 3 + 64
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Decode latent features into a reconstructed frame using Laplacian merge.
+
         Args:
-            x: [B, 128, H/4, W/4] transformer fusion output
+            x (torch.Tensor): Transformer-fused features [B, 128, H/4, W/4].
+
         Returns:
-            output: [B, 3, H, W] reconstructed frame (clamped to [0,1])
+            torch.Tensor: Reconstructed output frame [B, 3, H, W].
         """
         # Low-frequency branch
         low_freq, lf_features = self.low_freq(x)  # [B,3,H,W], [B,64,H,W]

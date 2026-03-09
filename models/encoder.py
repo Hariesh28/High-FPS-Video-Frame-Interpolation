@@ -13,12 +13,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+from typing import List, Tuple, Optional, Union
 
 
 class ResidualBlock(nn.Module):
-    """Conv3×3 → GN → GELU → Conv3×3 → GN + skip connection."""
+    """
+    Standard ResBlock: Conv3x3 → GroupNorm → GELU → Conv3x3 → GroupNorm.
 
-    def __init__(self, channels):
+    Attributes:
+        channels (int): Number of input and output channels.
+    """
+
+    def __init__(self, channels: int):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.gn1 = nn.GroupNorm(num_groups=8, num_channels=channels)
@@ -26,21 +32,32 @@ class ResidualBlock(nn.Module):
         self.gn2 = nn.GroupNorm(num_groups=8, num_channels=channels)
         self.act = nn.GELU()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape [B, C, H, W].
+
+        Returns:
+            torch.Tensor: Residual-enhanced features.
+        """
         residual = x
         out = self.act(self.gn1(self.conv1(x)))
         out = self.gn2(self.conv2(out))
         return self.act(out + residual)
 
 
-def window_partition(x, window_size):
-    """Partition feature map into non-overlapping windows.
+def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
+    """
+    Partition feature map into non-overlapping windows.
 
     Args:
-        x: [B, H, W, C]
-        window_size: int
+        x (torch.Tensor): Input tensor of shape [B, H, W, C].
+        window_size (int): Size of the window.
+
     Returns:
-        windows: [B*num_windows, window_size, window_size, C]
+        torch.Tensor: Windows of shape [B*num_windows, window_size, window_size, C].
     """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
@@ -50,15 +67,20 @@ def window_partition(x, window_size):
     return windows
 
 
-def window_reverse(windows, window_size, H, W):
-    """Reverse window partition.
+def window_reverse(
+    windows: torch.Tensor, window_size: int, H: int, W: int
+) -> torch.Tensor:
+    """
+    Reverse window partition.
 
     Args:
-        windows: [B*num_windows, window_size, window_size, C]
-        window_size: int
-        H, W: original spatial dims
+        windows (torch.Tensor): Windows of shape [B*num_windows, window_size, window_size, C].
+        window_size (int): Size of the window.
+        H (int): Original height.
+        W (int): Original width.
+
     Returns:
-        x: [B, H, W, C]
+        torch.Tensor: Reconstructed feature map of shape [B, H, W, C].
     """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(
@@ -295,21 +317,21 @@ class HybridEncoder(nn.Module):
     Hybrid CNN + Swin Transformer encoder.
 
     Returns multi-scale features at 5 levels:
-        f1: [B,32,H,W]
-        f2: [B,64,H/2,W/2]
-        f3: [B,96,H/4,W/4]
-        f4: [B,128,H/8,W/8]
-        f5: [B,160,H/16,W/16]
+        f1: [B, 32, H, W]
+        f2: [B, 64, H/2, W/2]
+        f3: [B, 96, H/4, W/4]
+        f4: [B, 128, H/8, W/8]
+        f5: [B, 160, H/16, W/16]
     """
 
     def __init__(
         self,
-        in_channels=3,
-        stage_channels=(32, 64, 96, 128, 160),
-        swin_depth=4,
-        swin_heads=6,
-        swin_window_size=8,
-        swin_mlp_ratio=4.0,
+        in_channels: int = 3,
+        stage_channels: Tuple[int, ...] = (32, 64, 96, 128, 160),
+        swin_depth: int = 4,
+        swin_heads: int = 6,
+        swin_window_size: int = 8,
+        swin_mlp_ratio: float = 4.0,
     ):
         super().__init__()
         c1, c2, c3, c4, c5 = stage_channels
@@ -360,12 +382,15 @@ class HybridEncoder(nn.Module):
         # Stage 5: 1/16 resolution — Patch merge
         self.patch_merge = PatchMerge(c4, c5)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
+        Extract multi-scale feature pyramid.
+
         Args:
-            x: [B, 3, H, W]
+            x (torch.Tensor): Input frames of shape [B, 3, H, W].
+
         Returns:
-            features: list of [f1, f2, f3, f4, f5]
+            List[torch.Tensor]: List of five feature tensors [f1, f2, f3, f4, f5].
         """
         # Stage 1
         f1 = self.stage1(x)  # [B, 32, H, W]

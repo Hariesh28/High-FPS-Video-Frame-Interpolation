@@ -18,9 +18,14 @@ also runs fp32. Both are cached on device to reduce alloc overhead.
 """
 
 import math
+import logging
+from typing import List, Tuple, Optional, Dict, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 import warnings
 
@@ -31,18 +36,20 @@ try:
     HAS_DEFORMABLE = True
 except ImportError:
     HAS_DEFORMABLE = False
-    warnings.warn(
+    logger.warning(
         "torchvision.ops.deform_conv2d not found. Falling back to standard convolutions."
     )
 
 
 class FlowConfidence(nn.Module):
-    """Predict confidence map from features + flow.
+    """
+    Predicts a flow confidence map from feature-flow concatenations.
 
-    Output: [B,1,H,W] in [0,1] via sigmoid.
+    Attributes:
+        in_channels (int): Number of input channels (features + flow).
     """
 
-    def __init__(self, in_channels):
+    def __init__(self, in_channels: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 64, 3, padding=1),
@@ -51,7 +58,10 @@ class FlowConfidence(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to compute [B, 1, H, W] confidence.
+        """
         return self.net(x)
 
 
@@ -93,13 +103,16 @@ class DeformableRefinementBlock(nn.Module):
             nn.Conv2d(64, 2, 3, padding=1),
         )
 
-    def forward(self, feat, flow):
+    def forward(self, feat: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
         """
+        Apply deformable refinement to the flow field.
+
         Args:
-            feat: [B, C, H, W] context features
-            flow: [B, 2, H, W] current flow estimate
+            feat (torch.Tensor): Context features of shape [B, C, H, W].
+            flow (torch.Tensor): Current flow estimate of shape [B, 2, H, W].
+
         Returns:
-            refined_flow: [B, 2, H, W]
+            torch.Tensor: Refined flow field of shape [B, 2, H, W].
         """
         inp_cat = torch.cat([feat, flow], dim=1)
 
@@ -167,13 +180,18 @@ class GMFlowMatching(nn.Module):
             self._coord_cache[key] = coords
         return self._coord_cache[key]
 
-    def forward(self, fL, fR):
+    def forward(
+        self, fL: torch.Tensor, fR: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Compute global matching flow and confidence.
+
         Args:
-            fL, fR: [B, C, H, W] projected features
+            fL (torch.Tensor): Left frame features [B, C, H, W].
+            fR (torch.Tensor): Right frame features [B, C, H, W].
+
         Returns:
-            flow: [B, 2, H, W] expected displacement
-            conf: [B, 1, H, W] confidence
+            Tuple[torch.Tensor, torch.Tensor]: (flow [B, 2, H, W], confidence [B, 1, H, W]).
         """
         B, C, H, W = fL.shape
         HW = H * W
@@ -241,13 +259,11 @@ class GMFlowMatching(nn.Module):
             )
             import warnings
 
-            warnings.warn(
+            logger.warning(
                 f"[GMFlowMatching] OOM triggered: fell back to chunk_size={active_chunk} "
                 f"(was {self.chunk_size}). "
                 f"Peak GPU memory: {peak_mb:.0f} MB. "
-                f"Consider setting corr_chunk_size={active_chunk} in config.yaml to avoid this overhead.",
-                RuntimeWarning,
-                stacklevel=2,
+                f"Consider setting corr_chunk_size={active_chunk} in config.yaml to avoid this overhead."
             )
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -445,15 +461,18 @@ class FlowEstimator(nn.Module):
         # Middle flow projection: F_LR(2) + F_RL(2) + abs(2) + f_s1_feat(32) = 38
         self.middle_flow = MiddleFlowProjection(in_channels=38)
 
-    def _estimate_single_flow(self, feats_src, feats_trg):
-        """Estimate unidirectional flow from src to trg using feature pyramids.
+    def _estimate_single_flow(
+        self, feats_src: List[torch.Tensor], feats_trg: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Estimate unidirectional flow from src to trg using feature pyramids.
 
         Args:
-            feats_src: list of [f1, f2, f3, f4, f5] from encoder
-            feats_trg: list of [f1, f2, f3, f4, f5] from encoder
+            feats_src (List[torch.Tensor]): List of feature tensors from source encoder.
+            feats_trg (List[torch.Tensor]): List of feature tensors from target encoder.
+
         Returns:
-            flow: [B, 2, H, W]
-            conf: [B, 1, H, W]
+            Tuple[torch.Tensor, torch.Tensor]: (flow_full [B, 2, H, W], conf_full [B, 1, H, W]).
         """
         f_s1, f_s2, f_s3, f_s4, f_s5 = feats_src
         f_t1, f_t2, f_t3, f_t4, f_t5 = feats_trg
@@ -478,18 +497,25 @@ class FlowEstimator(nn.Module):
 
         return flow_full, conf_full
 
-    def forward(self, features_L, features_R):
+    def forward(
+        self, features_L: List[torch.Tensor], features_R: List[torch.Tensor]
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """
+        Forward pass for bidirectional and projected flow estimation.
+
         Args:
-            features_L: list of [f1, f2, f3, f4, f5] from encoder(L)
-            features_R: list of [f1, f2, f3, f4, f5] from encoder(R)
+            features_L (List[torch.Tensor]): Encoder features for left frame.
+            features_R (List[torch.Tensor]): Encoder features for right frame.
+
         Returns:
-            flow_lr: [B, 2, H, W]
-            flow_rl: [B, 2, H, W]
-            flow_lm: [B, 2, H, W]
-            flow_rm: [B, 2, H, W]
-            conf_lr: [B, 1, H, W]
-            conf_rl: [B, 1, H, W]
+            Tuple: (flow_lr, flow_rl, flow_lm, flow_rm, conf_lr, conf_rl).
         """
         # Forward flow estimation
         flow_lr, conf_lr = self._estimate_single_flow(features_L, features_R)

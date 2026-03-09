@@ -20,6 +20,9 @@ Augmentations (train):
 import os
 import random
 import glob
+import logging
+from typing import List, Tuple, Optional, Union
+
 import numpy as np
 from PIL import Image
 
@@ -27,22 +30,27 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
+logger = logging.getLogger(__name__)
+
 
 class NTIREDataset(Dataset):
-    """NTIRE Video Frame Interpolation dataset.
+    """
+    NTIRE Video Frame Interpolation dataset.
 
-    Extracts (L, M, R) triplets from video frame directories.
+    Attributes:
+        root (str): Path to dataset root.
+        mode (str): 'train' or 'val'.
+        crop_size (int): Size for random cropping.
+        augment (bool): Whether to apply data augmentation.
     """
 
-    def __init__(self, root, mode="train", crop_size=256, augment=True):
-        """
-        Args:
-            root: path to dataset root (e.g., 'train' or 'val')
-            mode: 'train' or 'val'
-            crop_size: random crop size for training
-            augment: whether to apply augmentations
-        """
+    def __init__(
+        self, root: str, mode: str = "train", crop_size: int = 256, augment: bool = True
+    ):
         super().__init__()
+        if not os.path.exists(root):
+            raise FileNotFoundError(f"Dataset root not found: {root}")
+
         self.root = root
         self.mode = mode
         self.crop_size = crop_size
@@ -61,7 +69,7 @@ class NTIREDataset(Dataset):
             for i in range(len(frames) - 2):
                 self.triplets.append((frames[i], frames[i + 1], frames[i + 2]))
 
-        print(
+        logger.info(
             f"[NTIREDataset] {mode}: Found {len(self.triplets)} triplets "
             f"from {len(vid_dirs)} videos in {root}"
         )
@@ -69,8 +77,16 @@ class NTIREDataset(Dataset):
     def __len__(self):
         return len(self.triplets)
 
-    def _load_image(self, path):
-        """Load image as float32 tensor in [0, 1]."""
+    def _load_image(self, path: str) -> torch.Tensor:
+        """
+        Load image as float32 tensor in [0, 1].
+
+        Args:
+            path (str): Path to image file.
+
+        Returns:
+            torch.Tensor: Image tensor of shape [3, H, W].
+        """
         img = Image.open(path).convert("RGB")
         img = torch.from_numpy(np.array(img)).float() / 255.0
         img = img.permute(2, 0, 1)  # [3, H, W]
@@ -128,12 +144,12 @@ class NTIREDataset(Dataset):
 
         return imgs
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        Get frame triplet.
+
         Returns:
-            L: [3, crop_size, crop_size] left frame
-            M: [3, crop_size, crop_size] middle frame (GT)
-            R: [3, crop_size, crop_size] right frame
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (L, M, R) images.
         """
         path_L, path_M, path_R = self.triplets[idx]
 

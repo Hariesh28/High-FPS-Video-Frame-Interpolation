@@ -244,7 +244,7 @@ def inference(config, args):
             ckpt_path = "checkpoints/best_model.pth"
 
         print(f"[Inference] Loading: {ckpt_path}")
-        ckpt = safe_torch_load(ckpt_path, map_location=device, weights_only=True)
+        ckpt = safe_torch_load(ckpt_path, map_location=device, weights_only=False)
         state_dict = extract_model_state(ckpt, warn=True)
         if state_dict is None:
             raise KeyError(f"No model weights found in checkpoint: {ckpt_path}")

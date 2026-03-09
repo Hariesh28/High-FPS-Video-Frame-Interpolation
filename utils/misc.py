@@ -126,11 +126,11 @@ def log_environment(writer=None, run_dir: str | None = None) -> dict:
     }
 
     # ---- stdout ----
-    print("=" * 60)
-    print("  Environment")
+    logger.info("=" * 60)
+    logger.info("  Environment")
     for k, v in info.items():
-        print(f"  {k:<14}: {v}")
-    print("=" * 60)
+        logger.info(f"  {k:<14}: {v}")
+    logger.info("=" * 60)
 
     # ---- TensorBoard ----
     if writer is not None:
@@ -149,6 +149,6 @@ def log_environment(writer=None, run_dir: str | None = None) -> dict:
                 json.dump(info, fh, indent=2)
             print(f"[misc] Environment info saved to {json_path}")
         except Exception as exc:
-            logger.warning("Failed to write run_info.json: %s", exc)
+            logger.error("Failed to write run_info.json: %s", exc)
 
     return info

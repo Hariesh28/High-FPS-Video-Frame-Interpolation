@@ -12,12 +12,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
+from typing import Optional, Tuple
 
 
 class MotionGuidedWindowAttention(nn.Module):
-    """Multi-head window attention with motion-guided positional sampling.
+    """
+    Multi-head window attention with motion-guided positional sampling.
 
-    Operates on windows of size (window_size, window_size).
+    Attributes:
+        dim (int): Input feature dimension.
+        window_size (int): Size of the attention window.
+        num_heads (int): Number of attention heads.
     """
 
     def __init__(self, dim, window_size=8, num_heads=8):
@@ -37,13 +42,18 @@ class MotionGuidedWindowAttention(nn.Module):
             nn.Linear(32, num_heads),
         )
 
-    def forward(self, x, flow_offset=None):
+    def forward(
+        self, x: torch.Tensor, flow_offset: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
+        Forward pass with optional motion-guided bias.
+
         Args:
-            x: [B*num_windows, N, C] where N = window_size^2
-            flow_offset: [B*num_windows, N, 2] optional flow-derived offsets
+            x (torch.Tensor): Windowed features [B*num_windows, N, C].
+            flow_offset (Optional[torch.Tensor]): Flow-derived offsets [B*num_windows, N, 2].
+
         Returns:
-            out: [B*num_windows, N, C]
+            torch.Tensor: Attentive features of shape [B*num_windows, N, C].
         """
         B_N, N, C = x.shape
         qkv = (
@@ -172,10 +182,13 @@ def window_reverse(windows, window_size, H, W):
 
 
 class TransformerFusion(nn.Module):
-    """Motion-guided transformer fusion module with Alternating Shifted-Window Attention.
+    """
+    Motion-guided transformer fusion module with Alternating Shifted-Window Attention.
 
-    Input:  [B, C_in, H/4, W/4]
-    Output: [B, 128, H/4, W/4]
+    Attributes:
+        in_channels (int): Input feature channels.
+        embed_dim (int): Embedding dimension.
+        num_blocks (int): Number of transformer blocks.
     """
 
     def __init__(
@@ -211,13 +224,18 @@ class TransformerFusion(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.output_proj = nn.Conv2d(embed_dim, embed_dim, 1)
 
-    def forward(self, x, flow=None):
+    def forward(
+        self, x: torch.Tensor, flow: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
+        Execute transformer-based feature fusion.
+
         Args:
-            x: [B, C, H, W] fused features
-            flow: [B, 2, H, W] optional flow for motion guidance
+            x (torch.Tensor): Fused features [B, C, H, W].
+            flow (Optional[torch.Tensor]): Full-resolution flow for guidance.
+
         Returns:
-            out: [B, 128, H, W]
+            torch.Tensor: Refined features of shape [B, 128, H, W].
         """
         B, C, H, W = x.shape
 

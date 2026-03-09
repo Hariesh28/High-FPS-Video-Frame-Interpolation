@@ -10,6 +10,15 @@
 data:
   train_dir: "data/NTIRE/train"
   val_dir: "data/NTIRE/val"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  # Colab specific overrides (applied if IS_COLAB=True)
+  colab:
+    drive_root: "/content/drive/MyDrive/GMTI_Data"
+    train_dir: "/content/drive/MyDrive/GMTI_Data/NTIRE/train"
+    val_dir: "/content/drive/MyDrive/GMTI_Data/NTIRE/val"
+    checkpoint_dir: "/content/drive/MyDrive/GMTI_Data/checkpoints"
+    log_dir: "/content/drive/MyDrive/GMTI_Data/logs"
   crop_size: 256
   num_workers: 0
   pin_memory: true
@@ -67,8 +76,8 @@ loss:
   laplacian: 0.3 # increased from 0.2 for better high-freq detail (do not exceed 0.4)
   warping: 0.1
   bidirectional: 0.05
-  smoothness: 0.01
-  # MSE term directly optimises PSNR = -10*log10(MSE).  Expected: +0.05-0.2 dB.
+  smoothness: 0.05 # Increased for better flow stability
+  # MSE term directly optimises PSNR = -10*log10(MSE).
   mse: 0.1
   charbonnier_eps: 1.0e-3
 
@@ -85,16 +94,14 @@ training:
   beta1: 0.9
   beta2: 0.999
   weight_decay: 0.999e-4
-  warmup_iters: 2000
+  warmup_iters: 5000 # Gradual kickoff to prevent diverging
   final_lr: 1.0e-6
-  batch_size: 1 # effective batch = batch_size × accumulate_steps = 8
-  # LR scaling: keep lr=2e-4 constant regardless of accumulate_steps.
-  # For linear scaling multiply lr by accumulate_steps yourself.
-  accumulate_steps: 4
+  batch_size: 1
+  accumulate_steps: 16 # Effective batch size = 16
   clip_norm: 1.0
   amp: true # AMP mixed precision (auto-disabled on CPU)
   checkpoint_freq: 5000
-  val_freq: 2000
+  val_freq: 5000
   # Checkpoint retention policy:
   #   keep_last_checkpoints — most-recent iter_*.pth files to retain
   #   keep_best_checkpoints — best_ema.pth slots (always keep at least 1)
@@ -107,11 +114,8 @@ training:
   deterministic: false
   debug: false # If true, save flow visuals every 100 iters
 
-# ── EMA ──────────────────────────────────────────────────────────────────────
-ema:
-  # 0.99995 stabilises late-stage weights better than 0.9999.
-  # Expected improvement: +0.01-0.04 dB at final inference.
-  decay: 0.999
+  # 0.99995 stabilises late-stage weights better than 0.999.
+  decay: 0.99995
 
 # ── Inference ────────────────────────────────────────────────────────────────
 inference:
@@ -131,21 +135,21 @@ curriculum:
   stages:
     - stage: 1
       patch_size: 256
-      max_iters: 120000
+      max_iters: 100000
       lr: 2.0e-4
-      datasets: [ntire, vimeo90k, adobe240] # early: learn motion
+      datasets: [ntire, vimeo90k, adobe240]
       description: "Pretrain — learn general motion on mixed data"
     - stage: 2
       patch_size: 384
-      max_iters: 80000 # cumulative: 200k
+      max_iters: 60000
       lr: 1.0e-4
-      datasets: [ntire, vimeo90k, adobe240] # mid: refine details
+      datasets: [ntire, vimeo90k, adobe240]
       description: "Mid-resolution finetune — refine textures"
     - stage: 3
       patch_size: 512
-      max_iters: 40000 # cumulative: 240k (NTIRE only for final score)
+      max_iters: 20000
       lr: 2.0e-5
-      datasets: [ntire] # final: NTIRE-only for target domain
+      datasets: [ntire]
       description: "High-res NTIRE-only finetune — maximise submission PSNR"
 
 # ── Dataset Mixing (Item 4) ───────────────────────────────────────────────────

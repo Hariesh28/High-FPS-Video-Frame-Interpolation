@@ -24,15 +24,15 @@ Training vs Inference difference
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class OcclusionNetwork(nn.Module):
-    """Predict per-pixel occlusion mask from warped features.
+    """
+    Learned network to predict an occlusion/blending mask between warped frames.
 
-    The occlusion mask determines how much each frame contributes to the final
-    interpolated result.  During training an external geometric bidirectional
-    mask can be injected to guide the CNN; at inference time only the CNN
-    output is used.
+    Attributes:
+        feat_channels (int): Number of input feature channels.
     """
 
     def __init__(self, feat_channels: int = 96):
@@ -52,26 +52,18 @@ class OcclusionNetwork(nn.Module):
         self,
         warp_L: torch.Tensor,
         warp_R: torch.Tensor,
-        training_geom_mask: torch.Tensor | None = None,
+        training_geom_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute occlusion mask.
+        """
+        Predict the occlusion mask.
 
         Args:
-            warp_L:              [B, C, H, W] warped left-frame features.
-            warp_R:              [B, C, H, W] warped right-frame features.
-            training_geom_mask:  [B, 1, H, W] precomputed geometric consistency
-                                 mask (e.g. ``(bidir_err < tau).float()``).
-                                 Only applied during training; ignored at inference.
+            warp_L (torch.Tensor): Warped left features.
+            warp_R (torch.Tensor): Warped right features.
+            training_geom_mask (Optional[torch.Tensor]): Bidirectional constraint mask.
 
         Returns:
-            occ_mask: [B, 1, H, W] occlusion mask in [0, 1].
-
-        Notes:
-            Caller is responsible for computing the geometric mask, e.g.::
-
-                warped_rl, _ = backward_warp(flow_rl, flow_lr)
-                bidir_err    = (flow_lr + warped_rl).abs().mean(1, keepdim=True)
-                geom_mask    = (bidir_err < tau).float()
+            torch.Tensor: Occlusion mask of shape [B, 1, H, W].
         """
         x = torch.cat([warp_L, warp_R], dim=1)
         learned_mask = self.net(x)  # [B, 1, H, W] ∈ (0, 1)

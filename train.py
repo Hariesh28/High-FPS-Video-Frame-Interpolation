@@ -22,10 +22,11 @@ import copy
 import json
 import random
 import argparse
-import subprocess
+import logging
 import yaml
 import numpy as np
 from collections import OrderedDict
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -49,27 +50,38 @@ from utils.misc import (
     log_environment,
     _get_git_rev,
 )
+from utils.colab import setup_colab, get_colab_paths
 
 
 import torchvision.utils as vutils
 
+logger = logging.getLogger(__name__)
+
 
 class EMAModel:
-    """Exponential Moving Average of model parameters using deepcopy."""
+    """
+    Exponential Moving Average of model parameters.
 
-    def __init__(self, model, decay=0.9999):
+    Attributes:
+        decay (float): EMA decay rate (e.g., 0.9999).
+        ema_model (nn.Module): The shadow model containing averaged weights.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
         self.decay = decay
         self.ema_model = copy.deepcopy(model)
         for param in self.ema_model.parameters():
             param.requires_grad = False
 
     @torch.no_grad()
-    def update(self, model):
+    def update(self, model: nn.Module) -> None:
+        """Update EMA parameters based on current model weights."""
         for ema_param, param in zip(self.ema_model.parameters(), model.parameters()):
             if param.requires_grad:
                 ema_param.data.mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
 
-    def get_model(self):
+    def get_model(self) -> nn.Module:
+        """Return the EMA model."""
         return self.ema_model
 
 
@@ -87,8 +99,17 @@ def get_cosine_schedule(optimizer, warmup_iters, total_iters, final_lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def compute_psnr(pred, gt):
-    """Exact PSNR formula per user request: -10 * log10(MSE) with RGB in [0, 1]."""
+def compute_psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """
+    Compute peak signal-to-noise ratio.
+
+    Args:
+        pred (torch.Tensor): Predicted frame in [0, 1].
+        gt (torch.Tensor): Ground truth frame in [0, 1].
+
+    Returns:
+        float: PSNR value in dB.
+    """
     mse = F.mse_loss(pred, gt)
     if mse < 1e-10:
         return 100.0
@@ -111,25 +132,46 @@ def flow_to_color(flow):
     return rgb
 
 
-def train(config, args):
-    """Main training function."""
+def train(config: Dict[str, Any], args: argparse.Namespace) -> None:
+    """
+    Execute the main training loop.
+
+    Args:
+        config (Dict): Configuration dictionary from YAML.
+        args (Namespace): CLI arguments.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Train] Using device: {device}")
+    logger.info(f"Using device: {device}")
 
-    # ---- TensorBoard & Dirs (create early for log_environment) ----
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("checkpoints", exist_ok=True)
+    # ---- Colab Setup ----
+    is_colab = setup_colab()
+    if is_colab:
+        colab_paths = get_colab_paths(config["data"])
+        config["data"].update(colab_paths)
+
+    # ---- TensorBoard & Dirs (use config paths) ----
+    log_dir = config["data"].get("log_dir", "logs")
+    checkpoint_dir = config["data"].get("checkpoint_dir", "checkpoints")
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs("visualizations", exist_ok=True)
-    writer = SummaryWriter("logs")
+    writer = SummaryWriter(log_dir)
 
-    # ---- Environment logging (before dataset/model construction) ----
-    log_environment(writer, run_dir="logs")
+    # ---- Environment logging ----
+    log_environment(writer, run_dir=log_dir)
 
     # Debug visualisation frequency
     vis_freq = getattr(args, "vis_freq", 1000)
 
     # ---- Dataset & Sampler ----
-    stage_idx = getattr(args, "stage", 1) - 1
+    # Robustly get stage index: prefer args, then fall back to config or 1
+    raw_stage = getattr(args, "stage", None)
+    if raw_stage is None:
+        # If no stage in args, check if it's in config (though main() usually handles this)
+        raw_stage = config.get("training", {}).get("stage", 1)
+
+    stage_idx = int(raw_stage) - 1
+
     stages = config.get("curriculum", {}).get("stages", [])
     if 0 <= stage_idx < len(stages):
         dataset_names = stages[stage_idx].get("datasets", ["ntire"])
@@ -331,6 +373,15 @@ def train(config, args):
     # ---- Resume checkpoint ----
     start_iter = 0
     ckpt = None
+    best_psnr = 0.0
+
+    # Auto-detect latest checkpoint if not specified
+    if args.resume is None:
+        latest_path = os.path.join(checkpoint_dir, "latest.pth")
+        if os.path.exists(latest_path):
+            args.resume = latest_path
+            print(f"[Train] Auto-resuming from latest: {args.resume}")
+
     if args.resume:
         if os.path.exists(args.resume):
             print(f"[Train] Resuming from checkpoint: {args.resume}")
@@ -339,55 +390,79 @@ def train(config, args):
             print(f"[Warning] Checkpoint path not found: {args.resume}")
 
     if args.resume and ckpt is not None:
-
         state_dict = extract_model_state(ckpt, warn=True)
-        if state_dict is None:
-            raise KeyError(f"No model weights found in checkpoint: {args.resume}")
-        model.load_state_dict(state_dict)
+        if state_dict is not None:
+            model.load_state_dict(state_dict)
 
-        # Restore optimizer/scheduler/scaler if present
-        if "optimizer" in ckpt and hasattr(optimizer, "load_state_dict"):
-            optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt and hasattr(scheduler, "load_state_dict"):
-            try:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            except Exception:
-                # Some schedulers may not be fully serializable across versions
-                print("[Train] Warning: failed to load scheduler state; continuing")
-        if "scaler" in ckpt and hasattr(scaler, "load_state_dict"):
-            try:
-                scaler.load_state_dict(ckpt["scaler"])
-            except Exception:
-                print("[Train] Warning: failed to load GradScaler state; continuing")
+            # Reconstruct EMA from resumed model
+            ema = EMAModel(model, decay=ema_decay)
+            if "ema" in ckpt:
+                ema.ema_model.load_state_dict(ckpt["ema"])
 
-        # Restore RNG states if present
-        if "torch_rng" in ckpt:
-            try:
-                torch.set_rng_state(ckpt["torch_rng"].cpu())
-            except Exception:
-                print("[Train] Warning: failed to restore torch RNG state")
-        if (
-            "cuda_rng" in ckpt
-            and ckpt["cuda_rng"] is not None
-            and torch.cuda.is_available()
-        ):
-            try:
-                torch.cuda.set_rng_state_all(
-                    [state.cpu() for state in ckpt["cuda_rng"]]
-                )
-            except Exception:
-                print("[Train] Warning: failed to restore CUDA RNG state")
+            # Restore optimizer/scheduler/scaler if present
+            if "optimizer" in ckpt and hasattr(optimizer, "load_state_dict"):
+                optimizer.load_state_dict(ckpt["optimizer"])
+            if "scheduler" in ckpt and hasattr(scheduler, "load_state_dict"):
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler"])
+                except Exception:
+                    print("[Train] Warning: failed to load scheduler state")
+            if "scaler" in ckpt and hasattr(scaler, "load_state_dict"):
+                try:
+                    scaler.load_state_dict(ckpt["scaler"])
+                except Exception:
+                    print("[Train] Warning: failed to load GradScaler state")
 
-        start_iter = ckpt.get("iteration", 0)
-        print(f"[Train] Resumed from iteration {start_iter}")
+            # Restore RNG states if present
+            if "torch_rng" in ckpt:
+                try:
+                    torch.set_rng_state(ckpt["torch_rng"].cpu())
+                except Exception:
+                    print("[Train] Warning: failed to restore torch RNG state")
+            if (
+                "cuda_rng" in ckpt
+                and ckpt["cuda_rng"] is not None
+                and torch.cuda.is_available()
+            ):
+                try:
+                    torch.cuda.set_rng_state_all(
+                        [state.cpu() for state in ckpt["cuda_rng"]]
+                    )
+                except Exception:
+                    print("[Train] Warning: failed to restore CUDA RNG state")
+            if "np_rng" in ckpt:
+                try:
+                    np.random.set_state(ckpt["np_rng"])
+                except Exception:
+                    print("[Train] Warning: failed to restore numpy RNG state")
+            if "py_rng" in ckpt:
+                try:
+                    random.setstate(ckpt["py_rng"])
+                except Exception:
+                    print("[Train] Warning: failed to restore python RNG state")
+
+            start_iter = ckpt.get("iteration", 0)
+            best_psnr = ckpt.get("psnr", 0.0)
+            print(f"[Train] Resumed from iteration {start_iter}")
+        else:
+            print(f"[Train] Warning: No valid state dict found in {args.resume}")
+            ema = EMAModel(model, decay=ema_decay)
+    else:
+        ema = EMAModel(model, decay=ema_decay)
 
     # ---- Training loop ----
     model.train()
     data_iter = iter(train_loader)
-    best_psnr = 0.0
     optimizer.zero_grad(set_to_none=True)
 
-    pbar = tqdm(range(start_iter, max_iters), desc="Training", dynamic_ncols=True)
+    # Notebook-friendly tqdm
+    is_notebook = "ipykernel" in sys.modules or "google.colab" in sys.modules
+    pbar = tqdm(
+        range(start_iter, max_iters),
+        desc="Training",
+        dynamic_ncols=True,
+        mininterval=5.0 if is_notebook else 0.1,
+    )
 
     for iteration in pbar:
         # Get batch
@@ -533,9 +608,10 @@ def train(config, args):
                     "iteration": iteration + 1,
                     "psnr": val_psnr,
                 }
-                tmp_best = "checkpoints/.tmp_best_ema.pth"
+                best_path = os.path.join(checkpoint_dir, "best_ema.pth")
+                tmp_best = best_path + ".tmp"
                 torch.save(ckpt_data, tmp_best)
-                os.replace(tmp_best, "checkpoints/best_ema.pth")
+                os.replace(tmp_best, best_path)
                 print(f"[Val] New best EMA PSNR: {best_psnr:.2f}")
         # ---- Checkpoint ----
         ckpt_freq = config["training"]["checkpoint_freq"]
@@ -564,18 +640,46 @@ def train(config, args):
                 "git_rev": git_rev,
                 "config": config,
             }
-            final_path = f"checkpoints/iter_{iteration + 1}.pth"
+            final_path = os.path.join(checkpoint_dir, f"iter_{iteration + 1}.pth")
+            latest_path = os.path.join(checkpoint_dir, "latest.pth")
             atomic_save(checkpoint_data, final_path)
-            atomic_save(checkpoint_data, "checkpoints/latest.pth")
+            atomic_save(checkpoint_data, latest_path)
 
             # Prune old checkpoints (keep last N)
             prune_checkpoints(
-                ckpt_dir="checkpoints",
+                ckpt_dir=checkpoint_dir,
                 keep_last=config["training"].get("keep_last_checkpoints", 5),
             )
 
+    # ---- Final Save ----
+    # Ensure model is saved even if total iterations is not a multiple of ckpt_freq
+    print(f"[Train] Saving final checkpoint at iteration {max_iters}...")
+    checkpoint_data = {
+        "model": model.state_dict(),
+        "ema": ema.get_model().state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "iteration": max_iters,
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+        "np_rng": np.random.get_state(),
+        "py_rng": random.getstate(),
+        "config": config,
+    }
+    # Robustly get stage index for naming
+    raw_stage = getattr(args, "stage", None) or config.get("training", {}).get(
+        "stage", 1
+    )
+    stage_idx = int(raw_stage)
+    final_path = os.path.join(checkpoint_dir, f"stage_{stage_idx}_final.pth")
+    atomic_save(checkpoint_data, final_path)
+    atomic_save(checkpoint_data, os.path.join(checkpoint_dir, "latest.pth"))
+
     writer.close()
-    print(f"[Train] Complete! Best val PSNR: {best_psnr:.2f}")
+    print(f"[Train] Complete! Final model saved to {final_path}")
 
 
 def main():

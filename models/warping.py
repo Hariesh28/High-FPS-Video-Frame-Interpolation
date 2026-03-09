@@ -12,13 +12,18 @@ of sub-pixel coordinates measurably degrades PSNR.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple, Optional
 
 
 def flow_to_grid(flow: torch.Tensor) -> torch.Tensor:
-    """Convert flow [B,2,H,W] → normalised sampling grid [B,H,W,2].
+    """
+    Convert flow to a normalized sampling grid.
 
-    Runs in float32 regardless of the input dtype to avoid fp16 coordinate
-    rounding errors that degrade PSNR.
+    Args:
+        flow (torch.Tensor): Optical flow of shape [B, 2, H, W].
+
+    Returns:
+        torch.Tensor: Normalized sampling grid of shape [B, H, W, 2] in float32.
     """
     B, _, H, W = flow.shape
     # Always compute grid in fp32
@@ -38,16 +43,15 @@ def flow_to_grid(flow: torch.Tensor) -> torch.Tensor:
 
 
 def backward_warp(img: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
-    """Backward warp img using flow.
-
-    grid_sample is performed in float32 then cast back to the input dtype.
-    This prevents fp16 bilinear interpolation rounding that silently lowers PSNR.
+    """
+    Apply backward warping using a flow field.
 
     Args:
-        img:  [B, C, H, W]  — any dtype.
-        flow: [B, 2, H, W]  — any dtype.
+        img (torch.Tensor): Input image or feature tensor of shape [B, C, H, W].
+        flow (torch.Tensor): Optical flow tensor of shape [B, 2, H, W].
+
     Returns:
-        warped: [B, C, H, W] in the same dtype as img.
+        torch.Tensor: Warped tensor of shape [B, C, H, W] in original dtype.
     """
     orig_dtype = img.dtype
 
@@ -91,17 +95,19 @@ class DualWarping(nn.Module):
         img: torch.Tensor,
         features: torch.Tensor,
         flow: torch.Tensor,
-        confidence=None,  # kept for API compatibility; unused in backward warp
-    ):
+        confidence: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Execute dual-level warping.
+
         Args:
-            img:        [B, 3, H, W] input image.
-            features:   [B, C, H/4, W/4] stage-3 features.
-            flow:       [B, 2, H, W] flow at full resolution.
-            confidence: [B, 1, H, W] (optional, not used).
+            img (torch.Tensor): Full-resolution input image [B, 3, H, W].
+            features (torch.Tensor): Mid-resolution feature pyramid lvl [B, C, H/4, W/4].
+            flow (torch.Tensor): Full-resolution flow field [B, 2, H, W].
+            confidence (Optional[torch.Tensor]): Flow confidence (unused).
+
         Returns:
-            warped_feat: [B, C, H/4, W/4] warped and fused features.
-            warped_img:  [B, 3, H, W] warped image.
+            Tuple[torch.Tensor, torch.Tensor]: (warped_features, warped_image).
         """
         _, _, Hf, Wf = features.shape
         B, _, H, W = img.shape

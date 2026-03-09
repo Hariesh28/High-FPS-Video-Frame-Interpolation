@@ -17,12 +17,22 @@ Combined Loss:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Tuple, Optional, Any
 
 from .reconstruction import CharbonnierLoss, LaplacianPyramidLoss
 
 
-def backward_warp(img, flow):
-    """Backward warp using grid_sample (local copy to avoid circular imports)."""
+def backward_warp(img: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    """
+    Apply backward warping using grid_sample.
+
+    Args:
+        img (torch.Tensor): Input frame of shape [B, C, H, W].
+        flow (torch.Tensor): Optical flow of shape [B, 2, H, W].
+
+    Returns:
+        torch.Tensor: Warped frame of shape [B, C, H, W].
+    """
     B, C, H, W = img.shape
     grid_y, grid_x = torch.meshgrid(
         torch.arange(H, device=flow.device, dtype=flow.dtype),
@@ -40,10 +50,8 @@ def backward_warp(img, flow):
 
 
 class WarpingLoss(nn.Module):
-    """Warping consistency loss.
-
-    Measures how well the estimated intermediate flows can
-    warp the input frames to match the ground truth middle frame.
+    """
+    Measures the alignment consistency between warped input frames and the target.
     """
 
     def __init__(self):
@@ -174,17 +182,26 @@ class CombinedLoss(nn.Module):
         self.ms_scales = multiscale_scales or [0.0625, 0.125, 0.25, 1.0]
         self.ms_weights = multiscale_weights or [0.05, 0.2, 0.7, 1.0]
 
-    def forward(self, pred, gt, L, R, aux):
+    def forward(
+        self,
+        pred: torch.Tensor,
+        gt: torch.Tensor,
+        L: torch.Tensor,
+        R: torch.Tensor,
+        aux: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
+        Compute total loss with multi-scale supervision.
+
         Args:
-            pred: [B, 3, H, W] predicted frame
-            gt: [B, 3, H, W] ground truth
-            L: [B, 3, H, W] left input frame
-            R: [B, 3, H, W] right input frame
-            aux: dict from model forward with flow_lr, flow_rl, flow_lm, flow_rm
+            pred (torch.Tensor): Predicted frame [B, 3, H, W].
+            gt (torch.Tensor): Ground truth frame [B, 3, H, W].
+            L (torch.Tensor): Left frame.
+            R (torch.Tensor): Right frame.
+            aux (Dict): Auxiliary data from model (flow, masks, etc).
+
         Returns:
-            total_loss: scalar
-            loss_dict: dict of individual loss components
+            Tuple: (total_loss, dictionary_of_components).
         """
         flow_lr = aux["flow_lr"]
         flow_rl = aux["flow_rl"]

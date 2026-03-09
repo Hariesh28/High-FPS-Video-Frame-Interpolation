@@ -111,9 +111,18 @@ def validate(config, args):
     # CSV headers
     val_results = []
 
+    # Notebook-friendly tqdm
+    is_notebook = "ipykernel" in sys.modules or "google.colab" in sys.modules
     with torch.no_grad():
         # Adjust dataset to return paths if possible, else just keep counter
-        for i, (L, M, R) in enumerate(tqdm(val_loader, desc="Validating")):
+        for i, (L, M, R) in enumerate(
+            tqdm(
+                val_loader,
+                desc="Validating",
+                dynamic_ncols=True,
+                mininterval=5.0 if is_notebook else 0.1,
+            )
+        ):
             L = L.to(device)
             M = M.to(device)
             R = R.to(device)
