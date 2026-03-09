@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, Any
 
 from .reconstruction import CharbonnierLoss, LaplacianPyramidLoss
+from utils.freq import block_dct, get_hf_mask
 
 
 def backward_warp(img: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
@@ -137,6 +138,31 @@ class GradientLoss(nn.Module):
         return F.l1_loss(pred_dy, gt_dy) + F.l1_loss(pred_dx, gt_dx)
 
 
+class DCTLoss(nn.Module):
+    """
+    Frequency-domain supervision via block-DCT.
+    Prevents structured blurring by punishing energy loss in HF bands.
+    """
+
+    def __init__(self, block_size: int = 8, cutoff: int = 4):
+        super().__init__()
+        self.block_size = block_size
+        self.cutoff = cutoff
+
+    def forward(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        # Cast to float32 for FFT/DCT stability
+        pred32, gt32 = pred.float(), gt.float()
+
+        dct_pred = block_dct(pred32, self.block_size)
+        dct_gt = block_dct(gt32, self.block_size)
+
+        mask = get_hf_mask(self.block_size, pred.device, self.cutoff)
+        # Apply mask to the last two dims (block coefficients)
+        # dct: [B, C, H/b, W/b, b, b]
+        diff = (dct_pred - dct_gt) * mask
+        return F.mse_loss(diff, torch.zeros_like(diff))
+
+
 class CombinedLoss(nn.Module):
     """Combined loss with all components and multi-scale supervision.
 
@@ -152,13 +178,14 @@ class CombinedLoss(nn.Module):
 
     def __init__(
         self,
-        w_charb: float = 1.0,
-        w_lap: float = 0.3,
-        w_warp: float = 0.02,  # NTIRE Flow Refinement Trick
+        w_charb: float = 0.05,
+        w_lap: float = 0.25,
+        w_freq: float = 0.25,
+        w_warp: float = 0.1,
         w_bidir: float = 0.05,
         w_smooth: float = 0.01,
-        w_mse: float = 0.1,  # PSNR-targeted term: PSNR = -10*log10(MSE)
-        w_grad: float = 0.05,  # NTIRE Gradient Loss Trick
+        w_mse: float = 1.0,
+        w_grad: float = 0.05,
         charb_eps: float = 1e-3,
         multiscale_scales=None,
         multiscale_weights=None,
@@ -166,6 +193,7 @@ class CombinedLoss(nn.Module):
         super().__init__()
         self.w_charb = w_charb
         self.w_lap = w_lap
+        self.w_freq = w_freq
         self.w_warp = w_warp
         self.w_bidir = w_bidir
         self.w_smooth = w_smooth
@@ -174,6 +202,7 @@ class CombinedLoss(nn.Module):
 
         self.charb = CharbonnierLoss(eps=charb_eps)
         self.lap = LaplacianPyramidLoss(num_levels=4)
+        self.freq_loss = DCTLoss(block_size=8, cutoff=4)
         self.warp_loss = WarpingLoss()
         self.bidir_loss = BidirectionalFlowLoss()
         self.smooth_loss = FlowSmoothnessLoss()
@@ -208,9 +237,10 @@ class CombinedLoss(nn.Module):
         flow_lm = aux["flow_lm"]
         flow_rm = aux["flow_rm"]
 
-        # ---- Multi-scale Charbonnier + Laplacian ----
+        # ---- Multi-scale Charbonnier + Laplacian + Frequency ----
         loss_charb = 0.0
         loss_lap = 0.0
+        loss_freq = 0.0
         for scale, weight in zip(self.ms_scales, self.ms_weights):
             if scale < 1.0:
                 h = int(pred.shape[2] * scale)
@@ -227,6 +257,10 @@ class CombinedLoss(nn.Module):
 
             loss_charb = loss_charb + weight * self.charb(pred_s, gt_s)
             loss_lap = loss_lap + weight * self.lap(pred_s, gt_s)
+
+            # Apply DCT loss primarily at higher scales (>= 1/4)
+            if scale >= 0.25:
+                loss_freq = loss_freq + weight * self.freq_loss(pred_s, gt_s)
 
         # ---- Warping loss ----
         loss_warp = self.warp_loss(L, R, flow_lm, flow_rm, gt)
@@ -255,6 +289,7 @@ class CombinedLoss(nn.Module):
         total = (
             self.w_charb * loss_charb
             + self.w_lap * loss_lap
+            + self.w_freq * loss_freq
             + self.w_warp * loss_warp
             + self.w_bidir * loss_bidir
             + self.w_smooth * loss_smooth
@@ -265,6 +300,7 @@ class CombinedLoss(nn.Module):
         loss_dict = {
             "charb": loss_charb.item() if torch.is_tensor(loss_charb) else loss_charb,
             "lap": loss_lap.item() if torch.is_tensor(loss_lap) else loss_lap,
+            "freq": loss_freq.item() if torch.is_tensor(loss_freq) else loss_freq,
             "warp": loss_warp.item(),
             "bidir": loss_bidir.item(),
             "smooth": loss_smooth.item(),

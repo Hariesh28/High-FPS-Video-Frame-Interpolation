@@ -72,6 +72,62 @@ def backward_warp(img: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     return warped.to(orig_dtype)
 
 
+def local_kernel_warp(
+    img: torch.Tensor, flow: torch.Tensor, kernel: torch.Tensor
+) -> torch.Tensor:
+    """
+    Apply kernel-based warping (Deformable Kernel Synthesis).
+    Uses a 5x5 predicted kernel per pixel to weight the sampling neighborhood.
+
+    Args:
+        img (torch.Tensor): [B, 3, H, W]
+        flow (torch.Tensor): [B, 2, H, W]
+        kernel (torch.Tensor): [B, 25, H, W] (Softmax kernels)
+
+    Returns:
+        torch.Tensor: Filtered warped image.
+    """
+    B, C, H, W = img.shape
+    # Always fp32 for coordinate math
+    with torch.amp.autocast("cuda", enabled=False):
+        img_f32 = img.float()
+        grid = flow_to_grid(flow)  # [B, H, W, 2] normalized to [-1, 1]
+
+        # Unfold 5x5 neighborhood around the warped locations
+        # To do this efficiently, we first grid_sample to get the coarse location,
+        # but the spec asks for kernels *at* the warped location.
+        # MEMC-Net style: grid_sample 25 times with offsets.
+
+        offsets = torch.linspace(-2, 2, 5, device=img.device)
+        yy, xx = torch.meshgrid(offsets, offsets, indexing="ij")
+        rel_offsets = torch.stack([xx, yy], dim=-1).view(1, 1, 1, 25, 2)  # [1,1,1,25,2]
+
+        # Scale offsets to grid units: 2/W
+        scale = torch.tensor(
+            [2.0 / max(W - 1, 1), 2.0 / max(H - 1, 1)], device=img.device
+        ).view(1, 1, 1, 1, 2)
+        grid_offsets = rel_offsets * scale  # [1,1,1,25,2]
+
+        # Full grid: [B, H, W, 25, 2]
+        full_grid = grid.unsqueeze(3) + grid_offsets  # [B, H, W, 25, 2]
+        full_grid = full_grid.view(B, H, W * 25, 2)
+
+        # Sample: [B, 3, H, W*25]
+        samples = F.grid_sample(
+            img_f32,
+            full_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        samples = samples.view(B, 3, H, W, 25)
+
+        # Weighted sum: [B, 3, H, W, 25] * [B, 1, H, W, 25]
+        warped = torch.sum(samples * kernel.unsqueeze(1).permute(0, 1, 3, 4, 2), dim=-1)
+
+    return warped.to(img.dtype)
+
+
 class DualWarping(nn.Module):
     """Dual warping: feature-level + image-level warping.
 
@@ -95,16 +151,16 @@ class DualWarping(nn.Module):
         img: torch.Tensor,
         features: torch.Tensor,
         flow: torch.Tensor,
-        confidence: Optional[torch.Tensor] = None,
+        kernel: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Execute dual-level warping.
+        Execute dual-level warping with optional kernel synthesis.
 
         Args:
             img (torch.Tensor): Full-resolution input image [B, 3, H, W].
             features (torch.Tensor): Mid-resolution feature pyramid lvl [B, C, H/4, W/4].
             flow (torch.Tensor): Full-resolution flow field [B, 2, H, W].
-            confidence (Optional[torch.Tensor]): Flow confidence (unused).
+            kernel (Optional[torch.Tensor]): 5x5 kernels [B, 25, H, W].
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (warped_features, warped_image).
@@ -112,8 +168,18 @@ class DualWarping(nn.Module):
         _, _, Hf, Wf = features.shape
         B, _, H, W = img.shape
 
-        # Image-level warping (full resolution) — fp32 guard inside backward_warp
-        warped_img = backward_warp(img, flow)
+        # Image-level warping (full resolution)
+        if kernel is not None:
+            # Upsample kernel to full res if it was predicted at 1/4
+            if kernel.shape[2:] != img.shape[2:]:
+                kernel = F.interpolate(
+                    kernel, size=img.shape[2:], mode="bilinear", align_corners=False
+                )
+                # re-normalize softmax
+                kernel = torch.softmax(kernel, dim=1)
+            warped_img = local_kernel_warp(img, flow, kernel)
+        else:
+            warped_img = backward_warp(img, flow)
 
         # Feature-level warping — scale flow to feature resolution
         flow_scaled = F.interpolate(

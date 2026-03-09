@@ -55,6 +55,12 @@ from utils.colab import setup_colab, get_colab_paths
 
 import torchvision.utils as vutils
 
+from utils.vis_v3 import (
+    create_analytics_grid,
+    visualize_dct_spectrum,
+    visualize_kernels,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -328,11 +334,12 @@ def train(config: Dict[str, Any], args: argparse.Namespace) -> None:
     criterion = CombinedLoss(
         w_charb=config["loss"]["charbonnier"],
         w_lap=config["loss"]["laplacian"],
+        w_freq=config["loss"].get("freq", 0.25),
         w_warp=config["loss"]["warping"],
         w_bidir=config["loss"]["bidirectional"],
         w_smooth=config["loss"]["smoothness"],
         # MSE term directly optimises PSNR = -10*log10(MSE). Expected: +0.05-0.2 dB.
-        w_mse=config["loss"].get("mse", 0.1),
+        w_mse=config["loss"].get("mse", 1.0),
         charb_eps=config["loss"]["charbonnier_eps"],
         multiscale_scales=config["multiscale"]["scales"],
         multiscale_weights=config["multiscale"]["weights"],
@@ -459,9 +466,9 @@ def train(config: Dict[str, Any], args: argparse.Namespace) -> None:
     is_notebook = "ipykernel" in sys.modules or "google.colab" in sys.modules
     pbar = tqdm(
         range(start_iter, max_iters),
-        desc="Training",
+        desc=f"Stage {int(getattr(args, 'stage', 1))} Training",
         dynamic_ncols=True,
-        mininterval=5.0 if is_notebook else 0.1,
+        mininterval=3.0 if is_notebook else 0.1,
     )
 
     for iteration in pbar:
@@ -557,27 +564,36 @@ def train(config: Dict[str, Any], args: argparse.Namespace) -> None:
         for k, v in loss_dict.items():
             writer.add_scalar(f"train/loss_{k}", v, iteration)
 
-        # ---- Flow Visualization Debug Tool ----
+        # ---- V3 Advanced Visual Analytics ----
         if (iteration + 1) % vis_freq == 0:
             with torch.no_grad():
-                B_vis = min(4, L.shape[0])  # Save up to 4 items in batch
-                vis_grid = torch.cat(
-                    [
-                        L[:B_vis],
-                        flow_to_color(aux["flow_lm"][:B_vis]),
-                        aux["warped_img_L"][:B_vis],
-                        pred[:B_vis].clamp(0, 1),
-                        M[:B_vis],
-                        R[:B_vis],
-                    ],
-                    dim=0,
-                )  # [6*B, 3, H, W]
-                vutils.save_image(
-                    vis_grid,
-                    f"visualizations/iter_{iteration + 1:06d}.jpg",
-                    nrow=B_vis,
-                    normalize=False,
-                )
+                # 1. Save multi-row comprehensive debug grid
+                create_analytics_grid(L, R, pred, M, aux, iteration + 1)
+
+                # 2. Log DCT spectrum to TensorBoard
+                spectrum_fig = visualize_dct_spectrum(pred)
+                writer.add_figure("analytics/dct_spectrum", spectrum_fig, iteration)
+
+                # 3. Log Kernel heatmaps if available
+                if aux.get("kernels") is not None:
+                    kernel_fig = visualize_kernels(aux["kernels"])
+                    writer.add_figure(
+                        "analytics/learned_kernels", kernel_fig, iteration
+                    )
+
+        # Update progress bar with more details
+        if (iteration + 1) % 10 == 0:
+            vram = (
+                torch.cuda.memory_reserved(0) / 1024**3
+                if torch.cuda.is_available()
+                else 0
+            )
+            pbar.set_postfix(
+                loss=f"{loss.item() * accumulate_steps:.4f}",
+                psnr=f"{psnr:.2f}",
+                vram=f"{vram:.1f}G",
+                stage=getattr(args, "stage", 1),
+            )
 
         # ---- Validation ----
         val_freq = config["training"]["val_freq"]

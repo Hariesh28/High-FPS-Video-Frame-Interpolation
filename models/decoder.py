@@ -41,10 +41,9 @@ class ResBlock(nn.Module):
 
 
 class LowFrequencyBranch(nn.Module):
-    """Low-frequency progressive upsampling branch.
+    """Low-frequency progressive upsampling branch with skip connections.
 
-    Conv(128→96) → 2×ResBlock → Upsample ×2 → ... → [B, 32, H, W]
-    Then final conv to RGB.
+    Fuses encoder features at H/2 and H resolutions to recover textures.
     """
 
     def __init__(self, in_channels=128):
@@ -60,7 +59,7 @@ class LowFrequencyBranch(nn.Module):
 
         # H/2 → H
         self.up2 = nn.Sequential(
-            nn.Conv2d(96, 64, 3, padding=1, bias=False),
+            nn.Conv2d(96 + 64, 64, 3, padding=1, bias=False),  # 64 from skip
             nn.GroupNorm(8, 64),
             nn.GELU(),
             ResBlock(64),
@@ -69,30 +68,42 @@ class LowFrequencyBranch(nn.Module):
 
         # Final projection
         self.to_rgb = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.Conv2d(64 + 32, 32, 3, padding=1, bias=False),  # 32 from skip
             nn.GroupNorm(8, 32),
             nn.GELU(),
+            ResBlock(32),
             nn.Conv2d(32, 3, 3, padding=1),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, skips: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Execute progressive upsampling for low-frequency content.
+        Execute progressive upsampling with skip fusion.
 
         Args:
             x (torch.Tensor): Latent features [B, 128, H/4, W/4].
+            skips (Tuple): Warped encoder features (S2 [B, 64, H/2, W/2], S1 [B, 32, H, W]).
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (low_freq_rgb, spatial_features).
         """
+        s2, s1 = skips
+
         # H/4 → H/2
         x = self.up1(x)
         x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
 
+        # Fuse Stage-2 Skip
+        x = torch.cat([x, s2], dim=1)
+
         # H/2 → H
         x = self.up2(x)
-        feat = x  # Save for skip connection
+        feat = x  # Save for refinement head
         x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+
+        # Fuse Stage-1 Skip
+        x = torch.cat([x, s1], dim=1)
 
         # To RGB
         low_freq = self.to_rgb(x)
@@ -190,18 +201,21 @@ class FrequencyAwareDecoder(nn.Module):
         self.high_freq = HighFrequencyBranch(in_channels)
         self.detail_refine = DetailRefinementHead(in_channels=67)  # 3 + 64
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, skips: Tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
         """
-        Decode latent features into a reconstructed frame using Laplacian merge.
+        Decode latent features into a reconstructed frame using Laplacian merge and U-Net skips.
 
         Args:
             x (torch.Tensor): Transformer-fused features [B, 128, H/4, W/4].
+            skips (Tuple): Warped encoder features [(B,64,H/2,W/2), (B,32,H,W)].
 
         Returns:
             torch.Tensor: Reconstructed output frame [B, 3, H, W].
         """
-        # Low-frequency branch
-        low_freq, lf_features = self.low_freq(x)  # [B,3,H,W], [B,64,H,W]
+        # Low-frequency branch with skip fusion
+        low_freq, lf_features = self.low_freq(x, skips)  # [B,3,H,W], [B,64,H,W]
 
         # High-frequency branch
         high_freq = self.high_freq(x)  # [B,3,H,W]
