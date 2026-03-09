@@ -45,7 +45,8 @@ model:
     swin_window_size: 8
     swin_mlp_ratio: 4.0
   flow:
-    refinement_iters: 3
+    refinement_iters: 8 # Increased for sub-pixel accuracy
+    num_hypotheses: 3 # Pro mixture model
     use_deformable: true
   transformer:
     blocks: 6
@@ -74,12 +75,14 @@ convex:
 loss:
   charbonnier: 0.05
   laplacian: 0.25
-  freq: 0.25 # NEW: DCT-domain supervision
+  freq: 0.50 # Band-weighted frequency supervision
   warping: 0.10
   bidirectional: 0.05
   smoothness: 0.01
-  # MSE term directly optimises PSNR = -10*log10(MSE).
-  mse: 1.0 # PRIMARY PSNR TARGET
+  heteroscedastic: 0.1 # Sigma weighting
+  multi_hypothesis: 0.05
+  perceptual: 0.005 # Tiny VGG regularizer
+  mse: 1.0
   charbonnier_eps: 1.0e-3
 
 # ── Multi-scale supervision ──────────────────────────────────────────────────
@@ -148,7 +151,7 @@ curriculum:
       description: "Mid-resolution finetune — refine textures and edges"
     - stage: 3
       patch_size: 512
-      max_iters: 30000
+      max_iters: 50000 # Extended stage 3 for Pro convergence
       lr: 2.0e-5
       datasets: [ntire]
       description: "High-res NTIRE-only finetune — maximum submission PSNR"

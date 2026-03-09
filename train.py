@@ -334,12 +334,14 @@ def train(config: Dict[str, Any], args: argparse.Namespace) -> None:
     criterion = CombinedLoss(
         w_charb=config["loss"]["charbonnier"],
         w_lap=config["loss"]["laplacian"],
-        w_freq=config["loss"].get("freq", 0.25),
+        w_freq=config["loss"].get("freq", 0.50),
         w_warp=config["loss"]["warping"],
         w_bidir=config["loss"]["bidirectional"],
         w_smooth=config["loss"]["smoothness"],
-        # MSE term directly optimises PSNR = -10*log10(MSE). Expected: +0.05-0.2 dB.
         w_mse=config["loss"].get("mse", 1.0),
+        w_hetero=config["loss"].get("heteroscedastic", 0.1),
+        w_multi=config["loss"].get("multi_hypothesis", 0.05),
+        w_perceptual=config["loss"].get("perceptual", 0.005),
         charb_eps=config["loss"]["charbonnier_eps"],
         multiscale_scales=config["multiscale"]["scales"],
         multiscale_weights=config["multiscale"]["weights"],
@@ -490,9 +492,12 @@ def train(config: Dict[str, Any], args: argparse.Namespace) -> None:
         R = R.to(device, non_blocking=True)
 
         # Forward pass
+        progress = float(iteration) / max_iters
+        # Temperature schedule: start 1.0 -> 0.3 (sharper)
+        temp = 1.0 - 0.7 * progress
         with torch.amp.autocast("cuda", enabled=use_amp):
-            pred, aux = model(L, R)
-            loss, loss_dict = criterion(pred, M, L, R, aux)
+            pred, aux = model(L, R, temp=temp)
+            loss, loss_dict = criterion(pred, M, L, R, aux, progress=progress)
 
             # Scale loss for gradient accumulation
             loss = loss / accumulate_steps

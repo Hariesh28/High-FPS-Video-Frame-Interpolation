@@ -44,9 +44,6 @@ except ImportError:
 class FlowConfidence(nn.Module):
     """
     Predicts a flow confidence map from feature-flow concatenations.
-
-    Attributes:
-        in_channels (int): Number of input channels (features + flow).
     """
 
     def __init__(self, in_channels: int):
@@ -59,10 +56,55 @@ class FlowConfidence(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass to compute [B, 1, H, W] confidence.
-        """
         return self.net(x)
+
+
+class QuadraticMotionHead(nn.Module):
+    """
+    Predicts second-order motion (acceleration 'a') per patch.
+    Midpoint displacement: x_mid = x0 + 0.5*v + 0.25*a
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class MultiHypothesisFlowHead(nn.Module):
+    """
+    Predicts K flow candidates with softmax-normalized confidence fusion.
+    """
+
+    def __init__(self, context_dim: int, K: int = 3):
+        super().__init__()
+        self.K = K
+        self.flow_heads = nn.ModuleList(
+            [nn.Conv2d(context_dim, 2, 3, padding=1) for _ in range(K)]
+        )
+        self.conf_head = nn.Conv2d(context_dim, K, 3, padding=1)
+
+    def forward(
+        self, feat: torch.Tensor, temp: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            flows: [B, K, 2, H, W]
+            conf: [B, K, 1, H, W] (softmaxed weights)
+        """
+        B, C, H, W = feat.shape
+        flows = torch.stack([head(feat) for head in self.flow_heads], dim=1)
+        # Apply temperature scaling before softmax
+        conf = torch.softmax(self.conf_head(feat) / temp, dim=1).unsqueeze(
+            2
+        )  # [B, K, 1, H, W]
+        return flows, conf
 
 
 class DeformableRefinementBlock(nn.Module):
@@ -158,25 +200,26 @@ class IterativeRefinementBlock(nn.Module):
 
 class LocalKernelHead(nn.Module):
     """
-    Deformable kernel head for micro-motion adjustment.
-    Predicts 5x5 kernels per pixel to fix sampling residuals.
+    Separable Anisotropic kernel head.
+    Predicts 5x1 and 1x5 kernels + anisotropy for efficiency and detail.
     """
 
     def __init__(self, in_channels: int, kernel_size: int = 5):
         super().__init__()
-        self.k2 = kernel_size * kernel_size
+        self.ks = kernel_size
+        # 5 (row) + 5 (col) + 1 (anisotropy) = 11
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 64, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, self.k2, 1),
+            nn.Conv2d(64, 11, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Returns: [B, 25, H, W] softmax kernels.
+        Returns: [B, 11, H, W] raw parameters.
+        Separation and softmax happens in warping.py or synthesis logic.
         """
-        mask = self.net(x)
-        return torch.softmax(mask, dim=1)
+        return self.net(x)
 
 
 class SelfAttention(nn.Module):
@@ -504,23 +547,37 @@ class FlowRefinementStage(nn.Module):
 
 
 class FlowEstimator(nn.Module):
-    """Complete optical flow estimation pipeline.
+    """
+    Complete optical flow estimation pipeline for GMTI-Net.
 
-    1. Global correlation at 1/16 scale (GMFlow styled, robust numerics)
-    2. Coarse-to-fine multi-scale refinement (1/8 -> 1/4 -> 1/2) with Convex Upsampling
-    3. RAFT-style iterative sub-pixel refinement at 1/4 scale
-    4. Final upsample to full res
-    5. Local kernel head for micro-motion residuals
-    6. Middle flow projection
+    This module implements a multi-stage flow estimation strategy:
+    1. Global correlation matching at 1/16 scale for robust coarse flow.
+    2. Hierarchical refinement (1/8 -> 1/4 -> 1/2) using feature warping.
+    3. Iterative sub-pixel refinement at 1/4 scale (RAFT-style).
+    4. Multi-hypothesis flow prediction (K candidates).
+    5. Local kernel-based micro-motion refinement.
+    6. Heteroscedastic uncertainty estimation (log-sigma).
+    7. Second-order quadratic motion (acceleration) modeling.
+    8. Learned middle-frame flow projection.
     """
 
     def __init__(
         self,
         use_deformable: bool = True,
-        refine_iters: int = 4,
+        refine_iters: int = 8,
+        num_hypotheses: int = 3,
     ):
+        """
+        Initialize the FlowEstimator.
+
+        Args:
+            use_deformable (bool): Whether to use deformable convolutions in refinement blocks.
+            refine_iters (int): Number of sub-pixel iterative refinement iterations.
+            num_hypotheses (int): Number of flow candidates (K) for multi-hypothesis warping.
+        """
         super().__init__()
         self.refine_iters = refine_iters
+        self.K = num_hypotheses
 
         # Feature projection to restrict dimensional compute explosion
         self.proj = nn.Sequential(
@@ -553,89 +610,170 @@ class FlowEstimator(nn.Module):
         # Deformable kernel head for high-res residuals (at 1/4 scale context)
         self.kernel_head = LocalKernelHead(in_channels=96)
 
+        # Quadratic Motion Head (Acceleration)
+        self.quad_head = QuadraticMotionHead(160)
+
+        # Multi-Hypothesis Flow Head at stage 3 scale (1/4 res)
+        self.multi_flow_head = MultiHypothesisFlowHead(96, K=self.K)
+
         # Final upsample from 1/2 to full-res
         self.final_upsample = ConvexMaskUpsample(64)
 
         # Full resolution flow confidence
-        self.confidence_full = FlowConfidence(32 + 2)  # f1 is 32 channels
+        self.confidence_full = FlowConfidence(32 + 2)
 
-        # Middle flow projection: F_LR(2) + F_RL(2) + abs(2) + f_s1_feat(32) = 38
+        # Heteroscedastic Uncertainty Head (log_sigma)
+        self.sigma_head = nn.Sequential(
+            nn.Conv2d(32 + 2, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, 1),
+        )
+
+        # Middle flow projection
         self.middle_flow = MiddleFlowProjection(in_channels=38)
 
     def _estimate_single_flow(
-        self, feats_src: List[torch.Tensor], feats_trg: List[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        feats_src: List[torch.Tensor],
+        feats_trg: List[torch.Tensor],
+        temp: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Estimate unidirectional flow from src to trg using feature pyramids.
+        Estimate unidirectional flow and auxiliary parameters from source to target.
+
+        This method performs the core estimation loop:
+        1. Base flow estimation at 1/16 resolution.
+        2. Hierarchical refinement using features at 1/8, 1/4, and 1/2.
+        3. Iterative refinement at 1/4 resolution for sub-pixel accuracy.
+        4. Multi-hypothesis candidate generation.
+        5. Full resolution upsampling with learned confidence and uncertainty.
 
         Args:
-            feats_src (List[torch.Tensor]): List of feature tensors from source encoder.
-            feats_trg (List[torch.Tensor]): List of feature tensors from target encoder.
+            feats_src (List[torch.Tensor]): List of multiscale features for source frame.
+            feats_trg (List[torch.Tensor]): List of multiscale features for target frame.
+            temp (float): Softmax temperature for multi-hypothesis selection.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (flow_full [B, 2, H, W], conf_full [B, 1, H, W]).
+            Dict[str, torch.Tensor]: A dictionary containing normalized flows and auxiliaries.
         """
         f_s1, f_s2, f_s3, f_s4, f_s5 = feats_src
         f_t1, f_t2, f_t3, f_t4, f_t5 = feats_trg
 
-        # 1. Base flow from correlation at 1/16 scale
+        # 1. Base flow from correlation + Quadratic Acceleration
         f_s5_proj = self.proj(f_s5)
         f_t5_proj = self.proj(f_t5)
-
-        # Globally enhance features via self-attention before matching
         f_s5_proj = self.attn_src(f_s5_proj)
         f_t5_proj = self.attn_trg(f_t5_proj)
 
-        # correlation returns (flow, confidence)
-        flow_16, conf_16 = self.correlation(f_s5_proj, f_t5_proj)  # [B, 2, H/16, W/16]
+        flow_16, conf_16 = self.correlation(f_s5_proj, f_t5_proj)
+        accel_16 = self.quad_head(f_s5)
 
-        # 2. Coarse-to-fine Refinement (using Convex Mask Upsampling)
-        flow_8 = self.refine_8(flow_16, f_s5, f_s4)  # [B, 2, H/8, W/8]
-        flow_4 = self.refine_4(flow_8, f_s4, f_s3)  # [B, 2, H/4, W/4]
-        flow_2 = self.refine_2(flow_4, f_s3, f_s2)  # [B, 2, H/2, W/2]
+        # 2. Coarse-to-fine Refinement
+        flow_8 = self.refine_8(flow_16, f_s5, f_s4)
+        flow_4 = self.refine_4(flow_8, f_s4, f_s3)
+        flow_2 = self.refine_2(flow_4, f_s3, f_s2)
 
-        # 3. Iterative Sub-pixel Refinement (RAFT-style) at 1/4 resolution
-        # This reduces mis-warp MSE significantly.
+        # 3. Iterative Sub-pixel Refinement (RAFT-style)
         for _ in range(self.refine_iters):
             flow_4 = self.iterative_refine(flow_4, f_s3)
 
-        # 4. Final convex upsample to full resolution (H, W)
-        flow_full = self.final_upsample(flow_2, f_s2)
+        # 4. Multi-Hypothesis Flow (K candidates)
+        # We branch out at 1/4 resolution for robustness
+        flows_k_4, conf_k_4 = self.multi_flow_head(f_s3, temp=temp)
+        # Apply base flow_4 as offset to all K hypotheses
+        flows_k_4 = flows_k_4 + flow_4.unsqueeze(1)
 
-        # 5. Local kernel and Confidence map prediction at full res
-        # Predict local kernel at 1/4 scale context for final blurring fix
+        # 5. Final convex upsample to full resolution (H, W)
+        flow_full = self.final_upsample(flow_2, f_s2)
+        B, _, H, W = flow_full.shape
+
+        # Upsample Pro aux outputs to full resolution
+        accel_full = F.interpolate(
+            accel_16, size=(H, W), mode="bilinear", align_corners=False
+        )
+        flows_k_full = F.interpolate(
+            flows_k_4.view(B * self.K, 2, H // 4, W // 4),
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).view(B, self.K, 2, H, W)
+        conf_k_full = F.interpolate(
+            conf_k_4.view(B * self.K, 1, H // 4, W // 4),
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).view(B, self.K, 1, H, W)
+
+        # 6. Local kernel and Confidence map prediction
         kernel_4 = self.kernel_head(f_s3)
+        kernel_full = F.interpolate(
+            kernel_4, size=(H, W), mode="bilinear", align_corners=False
+        )
 
         conf_inp = torch.cat([f_s1, flow_full], dim=1)
         conf_full = self.confidence_full(conf_inp)
+        sigma_full = self.sigma_head(conf_inp)
 
-        return flow_full, conf_full, kernel_4
+        return {
+            "flow": flow_full,
+            "conf": conf_full,
+            "sigma": sigma_full,
+            "kernel": kernel_full,
+            "accel": accel_full,
+            "flows_k": flows_k_full,
+            "conf_k": conf_k_full,
+        }
 
     def forward(
-        self, features_L: List[torch.Tensor], features_R: List[torch.Tensor]
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+        self,
+        features_L: List[torch.Tensor],
+        features_R: List[torch.Tensor],
+        temp: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for bidirectional and projected flow estimation.
+        Estimate bidirectional flows and auxiliary parameters for frame interpolation.
+
+        This method orchestrates the full bidirectional estimation pipeline and
+        projects the resulting flows into the intermediate time t=0.5.
+
+        Args:
+            features_L (List[torch.Tensor]): List of multiscale features for the left frame.
+            features_R (List[torch.Tensor]): List of multiscale features for the right frame.
+            temp (float): Softmax temperature for multi-hypothesis flow selection.
 
         Returns:
-            Tuple: (flow_lr, flow_rl, flow_lm, flow_rm, conf_lr, conf_rl, kern_l, kern_r).
+            Dict[str, torch.Tensor]: A dictionary containing:
+                - 'flow_lr'/'flow_rl': Bidirectional flows.
+                - 'flow_lm'/'flow_rm': Intermediate frame projected flows.
+                - 'conf' / 'sigma': Confidence and uncertainty maps.
+                - 'flows_k' / 'conf_k': Multi-hypothesis candidates and weights.
+                - 'kernel': Local refinement kernels.
+                - 'accel': Patch-wise acceleration maps.
         """
         # Forward flow estimation
-        flow_lr, conf_lr, kern_l = self._estimate_single_flow(features_L, features_R)
+        out_l = self._estimate_single_flow(features_L, features_R, temp=temp)
 
         # Backward flow estimation
-        flow_rl, conf_rl, kern_r = self._estimate_single_flow(features_R, features_L)
+        out_r = self._estimate_single_flow(features_R, features_L, temp=temp)
 
-        # Middle flow projection
-        flow_lm, flow_rm = self.middle_flow(flow_lr, flow_rl, features_L[0])
+        # Middle flow projection (using primary flow_full)
+        flow_lm, flow_rm = self.middle_flow(out_l["flow"], out_r["flow"], features_L[0])
 
-        return flow_lr, flow_rl, flow_lm, flow_rm, conf_lr, conf_rl, kern_l, kern_r
+        return {
+            "flow_lr": out_l["flow"],
+            "flow_rl": out_r["flow"],
+            "flow_lm": flow_lm,
+            "flow_rm": flow_rm,
+            "conf_lr": out_l["conf"],
+            "conf_rl": out_r["conf"],
+            "sigma_lr": out_l["sigma"],
+            "sigma_rl": out_r["sigma"],
+            "kern_l": out_l["kernel"],
+            "kern_r": out_r["kernel"],
+            "accel_lr": out_l["accel"],
+            "accel_rl": out_r["accel"],
+            "flows_k_lr": out_l["flows_k"],
+            "flows_k_rl": out_r["flows_k"],
+            "conf_k_lr": out_l["conf_k"],
+            "conf_k_rl": out_r["conf_k"],
+        }

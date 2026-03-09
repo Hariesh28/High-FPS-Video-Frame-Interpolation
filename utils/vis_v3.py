@@ -80,6 +80,7 @@ def visualize_dct_spectrum(img_tensor):
 def create_analytics_grid(L, R, pred, GT, aux, it):
     """
     Creates a comprehensive debugging grid saved to disk.
+    Now includes Pro features: Acceleration maps.
     """
     import torchvision.utils as vutils
 
@@ -96,7 +97,7 @@ def create_analytics_grid(L, R, pred, GT, aux, it):
             dim=0,
         )
 
-        # 2. Flow Row: Flow_LM_Color, Flow_RM_Color, Conf_LM, Conf_RM, Occ_Mask
+        # 2. Flow/Pro Row: Flow_LM, Accel, Confidence_LR, Confidence_RL, Occ_Mask
         flm = (
             torch.from_numpy(
                 np.stack([flow_to_color(f) for f in aux["flow_lm"][:B_vis]])
@@ -106,19 +107,28 @@ def create_analytics_grid(L, R, pred, GT, aux, it):
             .float()
             / 255.0
         )
-        frm = (
-            torch.from_numpy(
-                np.stack([flow_to_color(f) for f in aux["flow_rm"][:B_vis]])
+
+        # Acceleration Vis (Pro): show magnitude of second-order motion
+        accel = aux.get("accel", aux.get("accel_lr"))
+        if accel is not None:
+            # Map [B, 2, H, W] to color (like flow) but normalize magnitude
+            accel_vis = (
+                torch.from_numpy(
+                    np.stack([flow_to_color(f, clip_flow=2.0) for f in accel[:B_vis]])
+                )
+                .permute(0, 3, 1, 2)
+                .to(L.device)
+                .float()
+                / 255.0
             )
-            .permute(0, 3, 1, 2)
-            .to(L.device)
-            .float()
-            / 255.0
-        )
+        else:
+            accel_vis = torch.zeros_like(flm)
+
         clm = aux["conf_lr"][:B_vis].repeat(1, 3, 1, 1)
         crm = aux["conf_rl"][:B_vis].repeat(1, 3, 1, 1)
         occ = aux["fused_mask"][:B_vis].repeat(1, 3, 1, 1)
-        row2 = torch.cat([flm, frm, clm, crm, occ], dim=0)
 
-    grid = torch.cat([row1, row2], dim=0)  # [20, 3, H, W] if B_vis=2
+        row2 = torch.cat([flm, accel_vis, clm, crm, occ], dim=0)
+
+    grid = torch.cat([row1, row2], dim=0)  # [row1, row2] stacked vertically
     vutils.save_image(grid, f"visualizations/analytics_iter_{it:06d}.png", nrow=5)

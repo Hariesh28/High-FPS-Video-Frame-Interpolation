@@ -15,18 +15,21 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
-def flow_to_grid(flow: torch.Tensor) -> torch.Tensor:
+def flow_to_grid(
+    flow: torch.Tensor, accel: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """
-    Convert flow to a normalized sampling grid.
+    Convert flow (and acceleration) to a normalized sampling grid.
+    If accel is provided, uses quadratic motion: x_mid = x0 + 0.5*v + 0.25*a
 
     Args:
-        flow (torch.Tensor): Optical flow of shape [B, 2, H, W].
+        flow (torch.Tensor): Optical flow [B, 2, H, W].
+        accel (Optional[torch.Tensor]): Acceleration [B, 2, H, W].
 
     Returns:
-        torch.Tensor: Normalized sampling grid of shape [B, H, W, 2] in float32.
+        torch.Tensor: Normalized sampling grid [B, H, W, 2] in float32.
     """
     B, _, H, W = flow.shape
-    # Always compute grid in fp32
     flow_f32 = flow.float()
 
     xs = torch.linspace(0, W - 1, W, device=flow.device, dtype=torch.float32)
@@ -34,37 +37,38 @@ def flow_to_grid(flow: torch.Tensor) -> torch.Tensor:
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
     grid = torch.stack((grid_x, grid_y), dim=-1)  # [H, W, 2]
     grid = grid.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 2]
-    vgrid = grid + flow_f32.permute(0, 2, 3, 1)  # pixel coords, fp32
+
+    # V-mid = 0.5 * flow + 0.25 * accel (if accel provided)
+    # Actually, flow is typically estimated for t=1.
+    # Displacement at t=0.5 is 0.5*v + 0.25*a.
+    v_mid = 0.5 * flow_f32
+    if accel is not None:
+        v_mid = v_mid + 0.25 * accel.float()
+
+    vgrid = grid + v_mid.permute(0, 2, 3, 1)
 
     # Normalise to [-1, 1]
     vgrid_x = 2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0
     vgrid_y = 2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0
-    return torch.stack((vgrid_x, vgrid_y), dim=-1)  # [B, H, W, 2] fp32
+    return torch.stack((vgrid_x, vgrid_y), dim=-1)
 
 
-def backward_warp(img: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+def backward_warp(
+    img: torch.Tensor, flow: torch.Tensor, accel: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """
-    Apply backward warping using a flow field.
-
-    Args:
-        img (torch.Tensor): Input image or feature tensor of shape [B, C, H, W].
-        flow (torch.Tensor): Optical flow tensor of shape [B, 2, H, W].
-
-    Returns:
-        torch.Tensor: Warped tensor of shape [B, C, H, W] in original dtype.
+    Apply backward warping with optional quadratic motion.
     """
     orig_dtype = img.dtype
 
-    # Force fp32 for grid computation and sampling
     with torch.amp.autocast("cuda", enabled=False):
         img_f32 = img.float()
-        grid = flow_to_grid(flow)  # always fp32 from flow_to_grid
+        grid = flow_to_grid(flow, accel)
 
         warped = F.grid_sample(
             img_f32, grid, mode="bilinear", padding_mode="border", align_corners=True
         )
 
-        # Validity mask: pixels whose sampling location is inside [-1,1]²
         valid = (grid[..., 0].abs() <= 1.0) & (grid[..., 1].abs() <= 1.0)
         valid = valid.unsqueeze(1).float()
         warped = warped * valid
@@ -72,74 +76,92 @@ def backward_warp(img: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     return warped.to(orig_dtype)
 
 
-def local_kernel_warp(
-    img: torch.Tensor, flow: torch.Tensor, kernel: torch.Tensor
+def multi_hypothesis_warp(
+    img: torch.Tensor, flows_k: torch.Tensor, conf_k: torch.Tensor
 ) -> torch.Tensor:
     """
-    Apply kernel-based warping (Deformable Kernel Synthesis).
-    Uses a 5x5 predicted kernel per pixel to weight the sampling neighborhood.
+    Fuses K warped versions of the image using predicted confidences.
+    flows_k: [B, K, 2, H, W]
+    conf_k: [B, K, 1, H, W] (already softmaxed)
+    """
+    B, K, _, H, W = flows_k.shape
+    warped_sum = 0
+    for k in range(K):
+        w_k = backward_warp(img, flows_k[:, k])
+        warped_sum = warped_sum + w_k * conf_k[:, k]
+    return warped_sum
 
-    Args:
-        img (torch.Tensor): [B, 3, H, W]
-        flow (torch.Tensor): [B, 2, H, W]
-        kernel (torch.Tensor): [B, 25, H, W] (Softmax kernels)
 
-    Returns:
-        torch.Tensor: Filtered warped image.
+def local_kernel_warp(
+    img: torch.Tensor, flow: torch.Tensor, kernel_params: torch.Tensor
+) -> torch.Tensor:
+    """
+    Separable Anisotropic Kernel Warping.
+    kernel_params: [B, 11, H, W]
+        - [0:5]: Row kernel (5 taps)
+        - [5:10]: Col kernel (5 taps)
+        - [10]: Anisotropy stretch
     """
     B, C, H, W = img.shape
-    # Always fp32 for coordinate math
     with torch.amp.autocast("cuda", enabled=False):
         img_f32 = img.float()
-        grid = flow_to_grid(flow)  # [B, H, W, 2] normalized to [-1, 1]
+        # 1. Softmax to get valid kernels
+        k_row = torch.softmax(kernel_params[:, :5], dim=1)
+        k_col = torch.softmax(kernel_params[:, 5:10], dim=1)
+        aniso = torch.sigmoid(kernel_params[:, 10:11]) + 0.5  # [B, 1, H, W]
 
-        # Unfold 5x5 neighborhood around the warped locations
-        # To do this efficiently, we first grid_sample to get the coarse location,
-        # but the spec asks for kernels *at* the warped location.
-        # MEMC-Net style: grid_sample 25 times with offsets.
+        # 2. Base Warping
+        grid = flow_to_grid(flow)  # [B, H, W, 2]
 
         offsets = torch.linspace(-2, 2, 5, device=img.device)
-        yy, xx = torch.meshgrid(offsets, offsets, indexing="ij")
-        rel_offsets = torch.stack([xx, yy], dim=-1).view(1, 1, 1, 25, 2)  # [1,1,1,25,2]
+        # Apply anisotropy to offsets: result [B, H, W, 5]
+        aniso_3d = aniso.squeeze(1).unsqueeze(-1)  # [B, H, W, 1]
+        off_col = offsets.view(1, 1, 1, 5) * aniso_3d
+        off_row = offsets.view(1, 1, 1, 5) / aniso_3d
 
-        # Scale offsets to grid units: 2/W
-        scale = torch.tensor(
-            [2.0 / max(W - 1, 1), 2.0 / max(H - 1, 1)], device=img.device
-        ).view(1, 1, 1, 1, 2)
-        grid_offsets = rel_offsets * scale  # [1,1,1,25,2]
-
-        # Full grid: [B, H, W, 25, 2]
-        full_grid = grid.unsqueeze(3) + grid_offsets  # [B, H, W, 25, 2]
-        full_grid = full_grid.view(B, H, W * 25, 2)
-
-        # Sample: [B, 3, H, W*25]
-        samples = F.grid_sample(
+        # 1D sampling (Row): grid_row [B, H, W, 5, 2]
+        grid_row = grid.unsqueeze(3) + torch.stack(
+            [off_row, torch.zeros_like(off_row)], dim=-1
+        ) * (2.0 / W)
+        grid_row = grid_row.view(B, H, W * 5, 2)
+        samples_row = F.grid_sample(
             img_f32,
-            full_grid,
+            grid_row,
             mode="bilinear",
             padding_mode="border",
             align_corners=True,
         )
-        samples = samples.view(B, 3, H, W, 25)
+        samples_row = samples_row.view(B, 3, H, W, 5)
+        img_row = torch.sum(
+            samples_row * k_row.unsqueeze(1).permute(0, 1, 3, 4, 2), dim=-1
+        )
 
-        # Weighted sum: [B, 3, H, W, 25] * [B, 1, H, W, 25]
-        warped = torch.sum(samples * kernel.unsqueeze(1).permute(0, 1, 3, 4, 2), dim=-1)
+        # 1D sampling (Col) on row-filtered result
+        grid_base = flow_to_grid(torch.zeros_like(flow))
+        grid_col = grid_base.unsqueeze(3) + torch.stack(
+            [torch.zeros_like(off_col), off_col], dim=-1
+        ) * (2.0 / H)
+        grid_col = grid_col.view(B, H, W * 5, 2)
+        samples_col = F.grid_sample(
+            img_row,
+            grid_col,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        samples_col = samples_col.view(B, 3, H, W, 5)
+        warped = torch.sum(
+            samples_col * k_col.unsqueeze(1).permute(0, 1, 3, 4, 2), dim=-1
+        )
 
     return warped.to(img.dtype)
 
 
 class DualWarping(nn.Module):
-    """Dual warping: feature-level + image-level warping.
-
-    Feature warping at H/4 scale for semantic alignment.
-    Image warping at full resolution for pixel accuracy.
-    Results are fused via a residual conv.
-    """
+    """Dual warping with Pro upgrades."""
 
     def __init__(self, feat_channels: int = 96):
         super().__init__()
-
-        # Feature-to-image fusion
         self.fusion = nn.Sequential(
             nn.Conv2d(feat_channels + 3, feat_channels, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -151,48 +173,50 @@ class DualWarping(nn.Module):
         img: torch.Tensor,
         features: torch.Tensor,
         flow: torch.Tensor,
-        kernel: Optional[torch.Tensor] = None,
+        kernel_params: Optional[torch.Tensor] = None,
+        accel: Optional[torch.Tensor] = None,
+        flows_k: Optional[torch.Tensor] = None,
+        conf_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Execute dual-level warping with optional kernel synthesis.
-
         Args:
-            img (torch.Tensor): Full-resolution input image [B, 3, H, W].
-            features (torch.Tensor): Mid-resolution feature pyramid lvl [B, C, H/4, W/4].
-            flow (torch.Tensor): Full-resolution flow field [B, 2, H, W].
-            kernel (Optional[torch.Tensor]): 5x5 kernels [B, 25, H, W].
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (warped_features, warped_image).
+            accel: Patch-based acceleration for quadratic motion.
+            flows_k: Multi-hypothesis flows [B, K, 2, H, W].
+            conf_k: Multi-hypothesis weights [B, K, 1, H, W].
         """
         _, _, Hf, Wf = features.shape
         B, _, H, W = img.shape
 
-        # Image-level warping (full resolution)
-        if kernel is not None:
-            # Upsample kernel to full res if it was predicted at 1/4
-            if kernel.shape[2:] != img.shape[2:]:
-                kernel = F.interpolate(
-                    kernel, size=img.shape[2:], mode="bilinear", align_corners=False
+        # 1. Image-level warping
+        if flows_k is not None and conf_k is not None:
+            # Multi-hypothesis fusion
+            warped_img = multi_hypothesis_warp(img, flows_k, conf_k)
+        elif kernel_params is not None:
+            # Upsample kernel_params if needed
+            if kernel_params.shape[2:] != img.shape[2:]:
+                kernel_params = F.interpolate(
+                    kernel_params,
+                    size=img.shape[2:],
+                    mode="bilinear",
+                    align_corners=False,
                 )
-                # re-normalize softmax
-                kernel = torch.softmax(kernel, dim=1)
-            warped_img = local_kernel_warp(img, flow, kernel)
+            warped_img = local_kernel_warp(img, flow, kernel_params)
         else:
-            warped_img = backward_warp(img, flow)
+            # Quadratic or Linear warp
+            warped_img = backward_warp(img, flow, accel)
 
-        # Feature-level warping — scale flow to feature resolution
+        # 2. Feature-level warping (usually coarse, keep it simple/linear)
         flow_scaled = F.interpolate(
             flow, size=(Hf, Wf), mode="bilinear", align_corners=False
         )
-        flow_scaled = flow_scaled * (Hf / H)  # scale flow magnitude
+        flow_scaled = flow_scaled * (Hf / H)
         warped_feat = backward_warp(features, flow_scaled)
 
-        # Fuse
+        # Fusion
         warped_img_down = F.interpolate(
             warped_img, size=(Hf, Wf), mode="bilinear", align_corners=False
         )
         fused = self.fusion(torch.cat([warped_feat, warped_img_down], dim=1))
-        warped_feat = warped_feat + fused  # residual fusion
+        warped_feat = warped_feat + fused
 
         return warped_feat, warped_img
